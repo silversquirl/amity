@@ -5,24 +5,31 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const mach_core_dep = b.dependency("mach_core", .{
-        .target = target,
-        .optimize = optimize,
-    });
-    const zflecs = b.dependency("zflecs", .{
-        .target = target,
-        .optimize = optimize,
-    });
+    const deps = .{
+        .mach = b.dependency("mach_core", .{
+            .target = target,
+            .optimize = optimize,
+        }),
+        .model3d = b.dependency("mach_model3d", .{
+            .target = target,
+            .optimize = optimize,
+        }),
+        .zflecs = b.dependency("zflecs", .{
+            .target = target,
+            .optimize = optimize,
+        }),
+    };
 
     const amity = b.addModule("amity", .{
         .root_source_file = .{ .path = "src/root.zig" },
         .target = target,
         .optimize = optimize,
     });
-    amity.addImport("mach-core", mach_core_dep.module("mach-core"));
-    amity.addImport("flecs", zflecs.module("zflecs"));
+    amity.addImport("mach-core", deps.mach.module("mach-core"));
+    amity.addImport("model3d", deps.model3d.module("mach-model3d"));
+    amity.addImport("flecs", deps.zflecs.module("zflecs"));
 
-    const app = try mach_core.App.init(b, mach_core_dep.builder, .{
+    const app = try mach_core.App.init(b, deps.mach.builder, .{
         .name = "amity",
         .src = "src/main.zig",
         .target = target,

@@ -30,7 +30,5 @@ pub fn update(app: *App) !bool {
         }
     }
 
-    // try app.engine.update(mach.delta_time);
-
     return app.engine.update(mach.delta_time);
 }
