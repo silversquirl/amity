@@ -34,15 +34,35 @@ const black: gpu.Color = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
 
 // TODO: use ECS relationships to avoid duplicating materials for each mesh
 pub const OpaqueMaterial = struct {
-    _: i32 = undefined,
+    color: [3]u8,
+    metallic: f32,
+    roughness: f32,
+    ior: f32,
 
     fn toGpu(mat: OpaqueMaterial) Gpu {
-        _ = mat;
-        return .{};
+        return .{
+            .color = packColor(mat.color),
+            .metallic = mat.metallic,
+            .roughness = mat.roughness,
+            .ior = mat.ior,
+        };
+    }
+
+    fn packColor(color: [3]u8) u32 {
+        var out: u32 = 0;
+        var i: u5 = 0;
+        while (i < color.len) : (i += 1) {
+            const c: u32 = color[i];
+            out |= c << 8 * (2 - i);
+        }
+        return out;
     }
 
     const Gpu = extern struct {
-        _: i32 = undefined,
+        color: u32,
+        metallic: f32,
+        roughness: f32,
+        ior: f32,
     };
 };
 
@@ -231,7 +251,7 @@ pub const MaterialStore = struct {
                         .binding = 0,
                         .visibility = .{ .fragment = true },
                         .buffer = .{
-                            .type = .storage,
+                            .type = .read_only_storage,
                             .min_binding_size = 0,
                         },
                     },

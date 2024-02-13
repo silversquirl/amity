@@ -61,9 +61,35 @@ fn loadScene(world: *flecs.world_t, path: [:0]const u8) !void {
     const materials = try mach.allocator.alloc(Renderer.OpaqueMaterial, scene.*.mNumMaterials);
     defer mach.allocator.free(materials);
     for (materials, scene.*.mMaterials) |*mat, ai_mat| {
-        // TODO
-        _ = ai_mat;
-        mat.* = .{};
+        mat.color = a: {
+            var color: c.aiColor4D = undefined;
+            if (c.aiGetMaterialColor(ai_mat, "$clr.base", 0, 0, &color) != c.aiReturn_SUCCESS) {
+                if (c.aiGetMaterialColor(ai_mat, "$clr.diffuse", 0, 0, &color) != c.aiReturn_SUCCESS) {
+                    std.log.warn("{s}: Missing base/diffuse color, defaulting to white", .{path});
+                    break :a .{ 0xff, 0xff, 0xff };
+                } else {
+                    std.log.info("{s}: Missing base color, using diffuse instead", .{path});
+                }
+            }
+            break :a .{
+                @intFromFloat(color.r * 0xff),
+                @intFromFloat(color.g * 0xff),
+                @intFromFloat(color.b * 0xff),
+            };
+        };
+
+        if (c.aiGetMaterialFloat(ai_mat, "$mat.metallicFactor", 0, 0, &mat.metallic) != c.aiReturn_SUCCESS) {
+            std.log.warn("{s}: Missing metallic factor, defaulting to 0", .{path});
+            mat.metallic = 0;
+        }
+        if (c.aiGetMaterialFloat(ai_mat, "$mat.roughnessFactor", 0, 0, &mat.roughness) != c.aiReturn_SUCCESS) {
+            std.log.warn("{s}: Missing roughness factor, defaulting to 0", .{path});
+            mat.roughness = 0;
+        }
+        if (c.aiGetMaterialFloat(ai_mat, "$mat.refracti", 0, 0, &mat.ior) != c.aiReturn_SUCCESS) {
+            std.log.warn("{s}: Missing IOR, defaulting to 1", .{path});
+            mat.ior = 1;
+        }
     }
 
     var indices = std.ArrayList(u32).init(mach.allocator);
