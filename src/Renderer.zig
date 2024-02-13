@@ -25,6 +25,9 @@ color_correct_pipe: *gpu.RenderPipeline,
 // Texture format used for HDR color buffers within the render pipeline
 const render_format: gpu.Texture.Format = .rgba16_float;
 
+const black: gpu.Color = .{ .r = 0, .g = 0, .b = 0, .a = 0 };
+
+// TODO: use ECS relationships to avoid duplicating materials for each mesh
 pub const OpaqueMaterial = struct {
     _: i32 = undefined,
 
@@ -37,12 +40,59 @@ pub const OpaqueMaterial = struct {
         _: i32 = undefined,
     };
 };
+
 pub const Geometry = struct {
+    index_count: u32,
+    index_buffer: *gpu.Buffer,
     vertex_count: u32,
     pos_buffer: *gpu.Buffer,
     normal_buffer: *gpu.Buffer,
+
+    pub fn init(indices: []const u32, positions: []const [3]f32, normals: []const [3]f32) Geometry {
+        std.debug.assert(positions.len == normals.len);
+
+        const index_buffer = mach.device.createBuffer(&.{
+            .usage = .{ .index = true },
+            .size = indices.len * @sizeOf(u32),
+            .mapped_at_creation = .true,
+        });
+        {
+            const indices_gpu = index_buffer.getMappedRange(u32, 0, indices.len).?;
+            defer index_buffer.unmap();
+            @memcpy(indices_gpu, indices);
+        }
+
+        const pos_buffer = mach.device.createBuffer(&.{
+            .usage = .{ .vertex = true },
+            .size = positions.len * 3 * @sizeOf(f32),
+            .mapped_at_creation = .true,
+        });
+        {
+            const positions_gpu = pos_buffer.getMappedRange([3]f32, 0, positions.len).?;
+            defer pos_buffer.unmap();
+            @memcpy(positions_gpu, positions);
+        }
+
+        const normal_buffer = mach.device.createBuffer(&.{
+            .usage = .{ .vertex = true },
+            .size = positions.len * 3 * @sizeOf(f32),
+            .mapped_at_creation = .true,
+        });
+        {
+            const normals_gpu = normal_buffer.getMappedRange([3]f32, 0, positions.len).?;
+            defer normal_buffer.unmap();
+            @memcpy(normals_gpu, normals);
+        }
+
+        return .{
+            .index_count = @intCast(indices.len),
+            .index_buffer = index_buffer,
+            .vertex_count = @intCast(positions.len),
+            .pos_buffer = pos_buffer,
+            .normal_buffer = normal_buffer,
+        };
+    }
 };
-const vec32_align = 4 * @sizeOf(f32);
 
 const GBuffer = struct {
     depth: *gpu.TextureView,
@@ -71,7 +121,7 @@ const DoubleBuffer = struct {
                     .render_attachment = true,
                     .texture_binding = true,
                 }),
-                .clear_value = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0 },
+                .clear_value = black,
                 .load_op = .clear,
                 .store_op = .store,
             };
@@ -97,14 +147,12 @@ const DoubleBuffer = struct {
 
 pub const MaterialStore = struct {
     items: std.ArrayListUnmanaged(OpaqueMaterial.Gpu) = .{},
-    usage: gpu.Buffer.UsageFlags,
     buf: ?*gpu.Buffer = null,
     buf_capacity: usize = 0,
     bind_layout: *gpu.BindGroupLayout,
 
-    pub fn init(usage: gpu.Buffer.UsageFlags) MaterialStore {
+    pub fn init() MaterialStore {
         return .{
-            .usage = usage,
             .bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
                 .entries = &.{
                     .{
@@ -140,7 +188,10 @@ pub const MaterialStore = struct {
 
             store.buf = mach.device.createBuffer(&.{
                 .size = store.items.capacity * @sizeOf(OpaqueMaterial.Gpu),
-                .usage = store.usage,
+                .usage = .{
+                    .copy_dst = true,
+                    .storage = true,
+                },
             });
         }
 
@@ -181,10 +232,7 @@ pub fn init(world: *flecs.world_t) !void {
         g_buffer.normal_material.release();
     }
 
-    var material_store = MaterialStore.init(.{
-        .copy_dst = true,
-        .uniform = true,
-    });
+    var material_store = MaterialStore.init();
     errdefer material_store.deinit();
 
     const deferred_shader = mach.device.createShaderModuleWGSL("deferred.wgsl", @embedFile("shader/deferred.wgsl"));
@@ -223,10 +271,16 @@ pub fn init(world: *flecs.world_t) !void {
                     .array_stride = 3 * @sizeOf(f32),
                     .attributes = &.{
                         .{ .format = .float32x3, .offset = 0, .shader_location = 0 },
+                        .{ .format = .float32x3, .offset = 0, .shader_location = 1 },
                     },
                 }),
             },
         }),
+
+        .depth_stencil = &.{
+            .format = .depth24_plus,
+            .depth_write_enabled = .true,
+        },
 
         .fragment = &gpu.FragmentState.init(.{
             .module = deferred_shader,
@@ -399,21 +453,24 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
         const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
             .color_attachments = &.{.{
                 .view = ren.g_buffer.normal_material,
-                .clear_value = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 1.0 },
-                .load_op = .clear,
+                .clear_value = black,
+                .load_op = if (i == 0) .clear else .load,
                 .store_op = .store,
             }},
             .depth_stencil_attachment = &.{
                 .view = ren.g_buffer.depth,
+                .depth_load_op = if (i == 0) .clear else .load,
+                .depth_store_op = .store,
             },
         }));
         defer pass.release();
 
         pass.setPipeline(ren.geom_pipe);
         pass.setBindGroup(0, ren.geom_uniform_bind, &.{});
+        pass.setIndexBuffer(g.index_buffer, .uint32, 0, g.index_count * @sizeOf(u32));
         pass.setVertexBuffer(0, g.pos_buffer, 0, g.vertex_count * 3 * @sizeOf(f32));
         pass.setVertexBuffer(1, g.normal_buffer, 0, g.vertex_count * 3 * @sizeOf(f32));
-        pass.draw(g.vertex_count, 1, 0, 0);
+        pass.drawIndexed(g.index_count, 1, 0, 0, 0);
         pass.end();
 
         mach.queue.submit(&.{encoder.finish(null)});
@@ -457,7 +514,7 @@ fn colorCorrect(it: *flecs.iter_t) callconv(.C) void {
         const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
             .color_attachments = &.{.{
                 .view = dest,
-                .clear_value = .{ .r = 0.0, .g = 0.0, .b = 0.0, .a = 0.0 },
+                .clear_value = black,
                 .load_op = .clear,
                 .store_op = .store,
             }},

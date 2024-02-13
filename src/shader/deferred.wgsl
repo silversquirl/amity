@@ -4,6 +4,14 @@ struct GeometryUniforms {
     material_idx: u32,
 }
 
+struct VertexInput {
+    @location(0) pos: vec3<f32>,
+    @location(1) normal: vec3<f32>
+}
+struct VertexOutput {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) normal: vec3<f32>,
+}
 struct GBufferOutput {
     @location(0) normal_material: vec4<u32>,
 }
@@ -12,19 +20,20 @@ struct GBufferOutput {
 
 // Geometry vertex shader
 @vertex
-fn vertex() -> @builtin(position) vec4<f32> {
-    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+fn vertex(in: VertexInput) -> VertexOutput {
+    return VertexOutput(
+        vec4<f32>(in.pos, 1.0),
+        in.normal,
+    );
 }
 
 // G-Buffer generation shader (runs on geometry)
 @fragment
-fn fragment() -> GBufferOutput {
-    let normal = vec3<f32>(0.0, 1.0, 0.0);
-    let material: u32 = 1;
+fn fragment(@location(0) normal: vec3<f32>) -> GBufferOutput {
     return GBufferOutput(
         vec4<u32>(
-            bitcast<vec3<u32>>(normal),
-            material
+            bitcast<vec3<u32>>(normalize(normal)),
+            gu.material_idx + 1
         ),
     );
 }

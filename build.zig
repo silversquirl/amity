@@ -10,9 +10,10 @@ pub fn build(b: *std.Build) !void {
             .target = target,
             .optimize = optimize,
         }),
-        .model3d = b.dependency("mach_model3d", .{
+        .assimp = b.dependency("assimp", .{
             .target = target,
             .optimize = optimize,
+            .formats = @as([]const u8, "Obj,STL,Ply"),
         }),
         .zflecs = b.dependency("zflecs", .{
             .target = target,
@@ -26,8 +27,8 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     amity.addImport("mach-core", deps.mach.module("mach-core"));
-    amity.addImport("model3d", deps.model3d.module("mach-model3d"));
     amity.addImport("flecs", deps.zflecs.module("zflecs"));
+    amity.linkLibrary(deps.assimp.artifact("assimp"));
 
     const app = try mach_core.App.init(b, deps.mach.builder, .{
         .name = "amity",
