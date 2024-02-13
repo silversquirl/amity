@@ -5,20 +5,19 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const opts = .{
+        .target = target,
+        .optimize = optimize,
+    };
     const deps = .{
-        .mach = b.dependency("mach_core", .{
-            .target = target,
-            .optimize = optimize,
-        }),
+        .mach = b.dependency("mach_core", opts),
         .assimp = b.dependency("assimp", .{
             .target = target,
             .optimize = optimize,
             .formats = @as([]const u8, "Obj,STL,Ply"),
         }),
-        .zflecs = b.dependency("zflecs", .{
-            .target = target,
-            .optimize = optimize,
-        }),
+        .zflecs = b.dependency("zflecs", opts),
+        .zmath = b.dependency("zmath", opts),
     };
 
     const amity = b.addModule("amity", .{
@@ -28,6 +27,7 @@ pub fn build(b: *std.Build) !void {
     });
     amity.addImport("mach-core", deps.mach.module("mach-core"));
     amity.addImport("flecs", deps.zflecs.module("zflecs"));
+    amity.addImport("zmath", deps.zmath.module("zmath"));
     amity.linkLibrary(deps.assimp.artifact("assimp"));
 
     const app = try mach_core.App.init(b, deps.mach.builder, .{

@@ -1,8 +1,10 @@
 const std = @import("std");
 const flecs = @import("flecs");
 const mach = @import("mach-core");
+const math = @import("zmath");
 
 const gpu = mach.gpu;
+const log = std.log.scoped(.amity_render);
 
 // TODO: rendering state should be handled through a few global entities, for better extensibility.
 //        - Postprocessor: contains post-processing data such as attachment double-buffer and post-processing vertex shader
@@ -22,6 +24,9 @@ shade_pipe: *gpu.RenderPipeline,
 post: DoubleBuffer,
 color_correct_pipe: *gpu.RenderPipeline,
 
+// TODO: use camera component
+mvp: math.Mat,
+
 // Texture format used for HDR color buffers within the render pipeline
 const render_format: gpu.Texture.Format = .rgba16_float;
 
@@ -36,7 +41,7 @@ pub const OpaqueMaterial = struct {
         return .{};
     }
 
-    const Gpu = struct {
+    const Gpu = extern struct {
         _: i32 = undefined,
     };
 };
@@ -98,50 +103,117 @@ const GBuffer = struct {
     depth: *gpu.TextureView,
     // Normal in RGB, material ID in alpha
     normal_material: *gpu.TextureView,
+    bind: *gpu.BindGroup,
 
     const targets: []const gpu.ColorTargetState = &.{
         // 0: normal & material
         .{ .format = .rgba32_uint },
     };
+
+    fn init() struct { GBuffer, *gpu.BindGroupLayout } {
+        const depth = createSwapchainTexture(.depth24_plus, .{
+            .render_attachment = true,
+        });
+        const normal_material = createSwapchainTexture(.rgba32_uint, .{
+            .render_attachment = true,
+            .texture_binding = true,
+        });
+
+        const bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
+            .entries = &.{
+                .{
+                    .binding = 0,
+                    .visibility = .{ .fragment = true },
+                    .texture = .{ .sample_type = .uint },
+                },
+            },
+        }));
+        const bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+            .layout = bind_layout,
+            .entries = &.{
+                .{ .binding = 0, .texture_view = normal_material, .size = 0 },
+            },
+        }));
+
+        return .{
+            .{
+                .depth = depth,
+                .normal_material = normal_material,
+                .bind = bind,
+            },
+            bind_layout,
+        };
+    }
+
+    fn deinit(buf: GBuffer) void {
+        buf.depth.release();
+        buf.normal_material.release();
+        buf.bind.release();
+    }
 };
 
-const GeometryUniforms = struct {
+const GeometryUniforms = extern struct {
     material_idx: u32,
+    transform: [4][4]f32 align(16),
 };
 
 const DoubleBuffer = struct {
-    buf: [2]gpu.RenderPassColorAttachment,
+    attach: [2]gpu.RenderPassColorAttachment,
+    bind: [2]*gpu.BindGroup,
     idx: u1 = 0,
 
-    fn init() DoubleBuffer {
-        var buf: [2]gpu.RenderPassColorAttachment = undefined;
-        for (&buf) |*a| {
+    fn init() struct { DoubleBuffer, *gpu.BindGroupLayout } {
+        const bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
+            .entries = &.{
+                .{
+                    .binding = 0,
+                    .visibility = .{ .fragment = true },
+                    .texture = .{ .sample_type = .float },
+                },
+            },
+        }));
+
+        var attach: [2]gpu.RenderPassColorAttachment = undefined;
+        var bind: [2]*gpu.BindGroup = undefined;
+        for (&attach, &bind) |*a, *b| {
+            const tex = createSwapchainTexture(render_format, .{
+                .render_attachment = true,
+                .texture_binding = true,
+            });
+
             a.* = .{
-                .view = createSwapchainTexture(render_format, .{
-                    .render_attachment = true,
-                    .texture_binding = true,
-                }),
+                .view = tex,
                 .clear_value = black,
                 .load_op = .clear,
                 .store_op = .store,
             };
+
+            b.* = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+                .layout = bind_layout,
+                .entries = &.{
+                    .{ .binding = 0, .texture_view = tex, .size = 0 },
+                },
+            }));
         }
-        return .{ .buf = buf };
+
+        return .{ .{ .attach = attach, .bind = bind }, bind_layout };
     }
-    fn deinit(post: DoubleBuffer) void {
-        for (post.buf) |a| {
+
+    fn deinit(buf: DoubleBuffer) void {
+        for (buf.attach, buf.bind) |a, b| {
             a.view.?.release();
+            b.release();
         }
     }
 
-    fn flip(post: *DoubleBuffer) void {
-        post.idx = 1 - post.idx;
+    fn flip(buf: *DoubleBuffer) void {
+        buf.idx = 1 - buf.idx;
     }
-    fn target(post: DoubleBuffer) gpu.RenderPassColorAttachment {
-        return post.buf[post.idx];
+    fn targetAttach(buf: DoubleBuffer) gpu.RenderPassColorAttachment {
+        return buf.attach[buf.idx];
     }
-    fn source(post: DoubleBuffer) gpu.RenderPassColorAttachment {
-        return post.buf[1 - post.idx];
+    fn sourceBind(buf: DoubleBuffer) *gpu.BindGroup {
+        return buf.bind[1 - buf.idx];
     }
 };
 
@@ -218,19 +290,9 @@ pub const MaterialStore = struct {
 };
 
 pub fn init(world: *flecs.world_t) !void {
-    const g_buffer: GBuffer = .{
-        .depth = createSwapchainTexture(.depth24_plus, .{
-            .render_attachment = true,
-        }),
-        .normal_material = createSwapchainTexture(.rgba32_uint, .{
-            .render_attachment = true,
-            .texture_binding = true,
-        }),
-    };
-    errdefer {
-        g_buffer.depth.release();
-        g_buffer.normal_material.release();
-    }
+    const g_buffer, const g_buffer_layout = GBuffer.init();
+    errdefer g_buffer.deinit();
+    defer g_buffer_layout.release();
 
     var material_store = MaterialStore.init();
     errdefer material_store.deinit();
@@ -305,7 +367,7 @@ pub fn init(world: *flecs.world_t) !void {
     defer fullscreen_shader.release();
 
     const shade_layout = mach.device.createPipelineLayout(&gpu.PipelineLayout.Descriptor.init(.{
-        .bind_group_layouts = &.{material_store.bind_layout},
+        .bind_group_layouts = &.{ g_buffer_layout, material_store.bind_layout },
     }));
     defer shade_layout.release();
     const shade_pipe = mach.device.createRenderPipeline(&.{
@@ -326,13 +388,21 @@ pub fn init(world: *flecs.world_t) !void {
     });
     errdefer shade_pipe.release();
 
-    const post = DoubleBuffer.init();
+    const post, const post_bind_layout = DoubleBuffer.init();
     errdefer post.deinit();
+    defer post_bind_layout.release();
 
     const color_correct_shader = mach.device.createShaderModuleWGSL("color_correct.wgsl", @embedFile("shader/color_correct.wgsl"));
     defer color_correct_shader.release();
 
+    const color_correct_layout = mach.device.createPipelineLayout(&gpu.PipelineLayout.Descriptor.init(.{
+        .bind_group_layouts = &.{post_bind_layout},
+    }));
+    defer color_correct_layout.release();
+
     const color_correct_pipe = mach.device.createRenderPipeline(&.{
+        .layout = color_correct_layout,
+
         .vertex = gpu.VertexState.init(.{
             .module = fullscreen_shader,
             .entry_point = "vertex",
@@ -348,6 +418,19 @@ pub fn init(world: *flecs.world_t) !void {
     });
     errdefer color_correct_pipe.release();
 
+    const mvp = a: {
+        const view = math.lookAtRh(
+            math.f32x4(0.5, 0.5, 0.5, 1),
+            math.f32x4(0, 0, 0, 1),
+            math.f32x4(0, 1, 0, 0),
+        );
+        const size = mach.size();
+        const width: f32 = @floatFromInt(size.width);
+        const height: f32 = @floatFromInt(size.height);
+        const proj = math.perspectiveFovRh(std.math.tau / 8.0, width / height, 0.1, 100);
+        break :a math.mul(view, proj);
+    };
+
     const ren = try mach.allocator.create(Renderer);
     ren.* = .{
         .phase = flecs.new_w_id(world, flecs.Phase),
@@ -361,6 +444,8 @@ pub fn init(world: *flecs.world_t) !void {
 
         .post = post,
         .color_correct_pipe = color_correct_pipe,
+
+        .mvp = mvp,
     };
     errdefer deinit(ren);
 
@@ -389,7 +474,7 @@ pub fn init(world: *flecs.world_t) !void {
         flecs.SYSTEM(world, "amity/render/color_correct", ren.phase, &desc);
     }
 
-    std.debug.print("registered render system\n", .{});
+    log.debug("init", .{});
 }
 
 fn deinit(ctx: ?*anyopaque) callconv(.C) void {
@@ -432,7 +517,7 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
     const mat = flecs.field(it, OpaqueMaterial, 1).?;
     const geom = flecs.field(it, Geometry, 2).?;
 
-    // TODO: cache material data
+    // TODO: use events to update material store rather than re-uploading every time
     ren.material_store.clearRetainingCapacity();
     for (mat) |m| {
         ren.material_store.append(m.toGpu()) catch @panic("OOM");
@@ -445,6 +530,7 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
         // TODO: cache uniform data
         mach.queue.writeBuffer(ren.geom_uniform_buf, 0, &[_]GeometryUniforms{.{
             .material_idx = @intCast(i),
+            .transform = ren.mvp,
         }});
 
         const encoder = mach.device.createCommandEncoder(null);
@@ -483,7 +569,7 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
 
         const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
             .color_attachments = &.{
-                ren.post.target(),
+                ren.post.targetAttach(),
             },
         }));
         defer pass.release();
@@ -493,7 +579,8 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
         defer bind.release();
 
         pass.setPipeline(ren.shade_pipe);
-        pass.setBindGroup(0, bind, &.{});
+        pass.setBindGroup(0, ren.g_buffer.bind, null);
+        pass.setBindGroup(1, bind, null);
         pass.draw(3, 1, 0, 0);
         pass.end();
 
@@ -521,6 +608,7 @@ fn colorCorrect(it: *flecs.iter_t) callconv(.C) void {
         }));
         defer pass.release();
         pass.setPipeline(ren.color_correct_pipe);
+        pass.setBindGroup(0, ren.post.sourceBind(), null);
         pass.draw(3, 1, 0, 0);
         pass.end();
     }

@@ -12,6 +12,7 @@
             .hash = "1220a57ac5fe4f45eae98d9b26f7cba93dca90782d631ef73a740b0190559d424054",
         },
         .zflecs = .{ .path = "vendor/zflecs" },
+        .zmath = .{ .path = "vendor/zmath" },
     },
 
     .paths = .{
