@@ -1,6 +1,7 @@
 const std = @import("std");
 const flecs = @import("flecs");
 const mach = @import("mach-core");
+const math = @import("zmath");
 const c = @cImport({
     @cInclude("assimp/cimport.h");
     @cInclude("assimp/scene.h");
@@ -24,7 +25,17 @@ pub const Engine = struct {
             try Renderer.init(world);
         }
 
-        try loadScene(world, "../../assets/bunny.obj");
+        try loadScene(world, "../../assets/cube.obj");
+
+        // Add sun
+        // TODO: light importing
+        {
+            const sun = flecs.new_entity(world, "Sun");
+            _ = flecs.set(world, sun, Renderer.light.Directional, .{
+                .color = .{ 255, 255, 255 },
+                .dir = math.normalize3(math.f32x4(-1.0, -2.0, -1.0, 0.0)),
+            });
+        }
 
         _ = flecs.progress(world, 0);
         return .{

@@ -13,19 +13,24 @@ const log = std.log.scoped(.amity_render);
 
 const Renderer = @This();
 phase: flecs.entity_t,
+light_query: *flecs.query_t,
 
 g_buffer: GBuffer,
 material_store: MaterialStore,
+light_store: LightStore,
+
 geom_pipe: *gpu.RenderPipeline,
-geom_uniform_buf: *gpu.Buffer,
-geom_uniform_bind: *gpu.BindGroup,
+geom_bind: *gpu.BindGroup,
 shade_pipe: *gpu.RenderPipeline,
+shade_bind: *gpu.BindGroup,
+
+// TODO: use camera component
+trans: Transforms,
+trans_uniform_buf: *gpu.Buffer,
+geom_uniform_buf: *gpu.Buffer,
 
 post: DoubleBuffer,
 color_correct_pipe: *gpu.RenderPipeline,
-
-// TODO: use camera component
-mvp: math.Mat,
 
 // Texture format used for HDR color buffers within the render pipeline
 const render_format: gpu.Texture.Format = .rgba16_float;
@@ -46,16 +51,6 @@ pub const OpaqueMaterial = struct {
             .roughness = mat.roughness,
             .ior = mat.ior,
         };
-    }
-
-    fn packColor(color: [3]u8) u32 {
-        var out: u32 = 0;
-        var i: u5 = 0;
-        while (i < color.len) : (i += 1) {
-            const c: u32 = color[i];
-            out |= c << 8 * (2 - i);
-        }
-        return out;
     }
 
     const Gpu = extern struct {
@@ -119,6 +114,35 @@ pub const Geometry = struct {
     }
 };
 
+pub const light = struct {
+    pub const Directional = struct {
+        color: [3]u8,
+        dir: math.Vec,
+
+        fn toGpu(l: Directional) Gpu {
+            return .{
+                .color = packColor(l.color),
+                .dir = math.vecToArr3(l.dir),
+            };
+        }
+
+        const Gpu = extern struct {
+            color: u32,
+            dir: [3]f32 align(16),
+        };
+    };
+};
+
+fn packColor(color: [3]u8) u32 {
+    var out: u32 = 0;
+    var i: u5 = 0;
+    while (i < color.len) : (i += 1) {
+        const c: u32 = color[i];
+        out |= c << 8 * (2 - i);
+    }
+    return out;
+}
+
 const GBuffer = struct {
     depth: *gpu.TextureView,
     // Normal in RGB, material ID in alpha
@@ -133,6 +157,7 @@ const GBuffer = struct {
     fn init() struct { GBuffer, *gpu.BindGroupLayout } {
         const depth = createSwapchainTexture(.depth24_plus, .{
             .render_attachment = true,
+            .texture_binding = true,
         });
         const normal_material = createSwapchainTexture(.rgba32_uint, .{
             .render_attachment = true,
@@ -144,6 +169,11 @@ const GBuffer = struct {
                 .{
                     .binding = 0,
                     .visibility = .{ .fragment = true },
+                    .texture = .{ .sample_type = .depth },
+                },
+                .{
+                    .binding = 1,
+                    .visibility = .{ .fragment = true },
                     .texture = .{ .sample_type = .uint },
                 },
             },
@@ -151,7 +181,8 @@ const GBuffer = struct {
         const bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
             .layout = bind_layout,
             .entries = &.{
-                .{ .binding = 0, .texture_view = normal_material, .size = 0 },
+                .{ .binding = 0, .texture_view = depth, .size = 0 },
+                .{ .binding = 1, .texture_view = normal_material, .size = 0 },
             },
         }));
 
@@ -172,9 +203,18 @@ const GBuffer = struct {
     }
 };
 
+const Transforms = struct {
+    view: math.Mat,
+    proj: math.Mat,
+
+    const Gpu = extern struct {
+        view: [4][4]f32 align(16),
+        vp: [4][4]f32 align(16),
+        inv_vp: [4][4]f32 align(16),
+    };
+};
 const GeometryUniforms = extern struct {
     material_idx: u32,
-    transform: [4][4]f32 align(16),
 };
 
 const DoubleBuffer = struct {
@@ -237,11 +277,68 @@ const DoubleBuffer = struct {
     }
 };
 
+pub fn UploadBuffer(comptime T: type, comptime usage_: gpu.Buffer.UsageFlags) type {
+    comptime var usage = usage_;
+    // Required for uploading
+    usage.copy_dst = true;
+
+    return struct {
+        items: std.ArrayListUnmanaged(T) = .{},
+        buf: ?*gpu.Buffer = null,
+        buf_capacity: usize = 0,
+
+        const Self = @This();
+
+        fn deinit(buf: *Self) void {
+            buf.items.deinit(mach.allocator);
+            if (buf.buf) |b| {
+                b.release();
+            }
+        }
+
+        pub fn upload(buf: *Self) void {
+            if (buf.buf_capacity != buf.items.capacity) {
+                if (buf.buf) |b| {
+                    b.release();
+                }
+                if (buf.items.capacity == 0) {
+                    buf.buf = null;
+                    return;
+                }
+                buf.buf = mach.device.createBuffer(&.{
+                    .size = buf.items.capacity * @sizeOf(T),
+                    .usage = usage,
+                });
+            }
+
+            if (buf.buf) |b| {
+                // TODO: partial updates
+                mach.queue.writeBuffer(b, 0, buf.items.items);
+            }
+        }
+
+        pub fn clearRetainingCapacity(buf: *Self) void {
+            buf.items.clearRetainingCapacity();
+        }
+        pub fn append(buf: *Self, item: T) !void {
+            try buf.items.append(mach.allocator, item);
+        }
+        pub fn len(buf: Self) usize {
+            return buf.items.items.len;
+        }
+        pub fn byteSize(buf: Self) usize {
+            return buf.len() * @sizeOf(T);
+        }
+
+        pub fn bindGroupEntry(buf: *Self, binding: u32) gpu.BindGroup.Entry {
+            return .{ .binding = binding, .buffer = buf.buf.?, .size = buf.byteSize() };
+        }
+    };
+}
+
 pub const MaterialStore = struct {
-    items: std.ArrayListUnmanaged(OpaqueMaterial.Gpu) = .{},
-    buf: ?*gpu.Buffer = null,
-    buf_capacity: usize = 0,
     bind_layout: *gpu.BindGroupLayout,
+    buf: UploadBuffer(OpaqueMaterial.Gpu, .{ .storage = true }) = .{},
 
     pub fn init() MaterialStore {
         return .{
@@ -261,51 +358,84 @@ pub const MaterialStore = struct {
     }
 
     pub fn deinit(store: *MaterialStore) void {
-        store.items.deinit(mach.allocator);
         store.bind_layout.release();
-        if (store.buf_capacity > 0) {
-            store.buf.?.release();
-        }
+        store.buf.deinit();
     }
 
     pub fn upload(store: *MaterialStore) void {
-        if (store.buf_capacity != store.items.capacity) {
-            if (store.buf_capacity > 0) {
-                store.buf.?.release();
-            }
-            if (store.items.capacity == 0) {
-                store.buf = null;
-                return;
-            }
-
-            store.buf = mach.device.createBuffer(&.{
-                .size = store.items.capacity * @sizeOf(OpaqueMaterial.Gpu),
-                .usage = .{
-                    .copy_dst = true,
-                    .storage = true,
-                },
-            });
-        }
-
-        // TODO: partial updates
-        mach.queue.writeBuffer(store.buf.?, 0, store.items.items);
+        store.buf.upload();
     }
 
-    pub fn bindGroup(store: MaterialStore) *gpu.BindGroup {
+    pub fn bindGroup(store: *MaterialStore) *gpu.BindGroup {
         // TODO: caching
         return mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
             .layout = store.bind_layout,
             .entries = &.{
-                .{ .binding = 0, .buffer = store.buf.?, .size = store.items.items.len * @sizeOf(OpaqueMaterial.Gpu) },
+                store.buf.bindGroupEntry(0),
             },
         }));
     }
 
-    pub fn clearRetainingCapacity(store: *MaterialStore) void {
-        store.items.clearRetainingCapacity();
+    pub fn clear(store: *MaterialStore) void {
+        store.buf.clearRetainingCapacity();
     }
-    pub fn append(store: *MaterialStore, item: OpaqueMaterial.Gpu) !void {
-        try store.items.append(mach.allocator, item);
+    pub fn append(store: *MaterialStore, mat: OpaqueMaterial) !void {
+        try store.buf.append(mat.toGpu());
+    }
+};
+
+pub const LightStore = struct {
+    bind_layout: *gpu.BindGroupLayout,
+    dir: UploadBuffer(light.Directional.Gpu, .{ .storage = true }) = .{},
+
+    pub fn init() LightStore {
+        return .{
+            .bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
+                .entries = &.{
+                    .{
+                        .binding = 0,
+                        .visibility = .{ .fragment = true },
+                        .buffer = .{
+                            .type = .read_only_storage,
+                            .min_binding_size = 0,
+                        },
+                    },
+                },
+            })),
+        };
+    }
+
+    pub fn deinit(store: *LightStore) void {
+        store.bind_layout.release();
+        store.dir.deinit();
+    }
+
+    pub fn upload(store: *LightStore) void {
+        // WebGPU requires buffer bindings be non-empty, which requires a dummy value for empty buffers.
+        // For simplicity, we add one to the end of all buffers, not just empty ones.
+        store.dir.append(undefined) catch @panic("OOM");
+
+        store.dir.upload();
+    }
+
+    pub fn bindGroup(store: *LightStore) *gpu.BindGroup {
+        // TODO: caching
+        return mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+            .layout = store.bind_layout,
+            .entries = &.{
+                store.dir.bindGroupEntry(0),
+            },
+        }));
+    }
+
+    pub fn clear(store: *LightStore) void {
+        store.dir.clearRetainingCapacity();
+    }
+    pub fn append(store: *LightStore, l: anytype) !void {
+        switch (@TypeOf(l)) {
+            light.Directional => try store.dir.append(l.toGpu()),
+            else => @compileError("invalid light type " ++ @typeName(@TypeOf(l))),
+        }
     }
 };
 
@@ -316,6 +446,8 @@ pub fn init(world: *flecs.world_t) !void {
 
     var material_store = MaterialStore.init();
     errdefer material_store.deinit();
+    var light_store = LightStore.init();
+    errdefer light_store.deinit();
 
     const deferred_shader = mach.device.createShaderModuleWGSL("deferred.wgsl", @embedFile("shader/deferred.wgsl"));
     defer deferred_shader.release();
@@ -324,10 +456,15 @@ pub fn init(world: *flecs.world_t) !void {
         .entries = &.{
             .{
                 .binding = 0,
-                .visibility = .{
-                    .vertex = true,
-                    .fragment = true,
+                .visibility = .{ .vertex = true },
+                .buffer = .{
+                    .type = .uniform,
+                    .min_binding_size = @sizeOf(Transforms.Gpu),
                 },
+            },
+            .{
+                .binding = 1,
+                .visibility = .{ .fragment = true },
                 .buffer = .{
                     .type = .uniform,
                     .min_binding_size = @sizeOf(GeometryUniforms),
@@ -362,6 +499,7 @@ pub fn init(world: *flecs.world_t) !void {
         .depth_stencil = &.{
             .format = .depth24_plus,
             .depth_write_enabled = .true,
+            .depth_compare = .less,
         },
 
         .fragment = &gpu.FragmentState.init(.{
@@ -372,24 +510,61 @@ pub fn init(world: *flecs.world_t) !void {
     });
     errdefer geom_pipe.release();
 
+    const trans: Transforms = .{
+        .view = math.lookAtRh(
+            math.f32x4(0.5, 0.5, 0.5, 1),
+            math.f32x4(0, 0, 0, 1),
+            math.f32x4(0, 1, 0, 0),
+        ),
+        .proj = a: {
+            const size = mach.size();
+            const width: f32 = @floatFromInt(size.width);
+            const height: f32 = @floatFromInt(size.height);
+            break :a math.perspectiveFovRh(std.math.tau / 8.0, width / height, 0.1, 100);
+        },
+    };
+
+    const trans_uniform_buf = mach.device.createBuffer(&.{
+        .size = @sizeOf(Transforms.Gpu),
+        .usage = .{ .copy_dst = true, .uniform = true },
+    });
     const geom_uniform_buf = mach.device.createBuffer(&.{
         .size = @sizeOf(GeometryUniforms),
         .usage = .{ .copy_dst = true, .uniform = true },
     });
-    const geom_uniform_bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+    const geom_bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
         .layout = geom_pipe.getBindGroupLayout(0),
         .entries = &.{
-            .{ .binding = 0, .buffer = geom_uniform_buf, .size = @sizeOf(GeometryUniforms) },
+            .{ .binding = 0, .buffer = trans_uniform_buf, .size = @sizeOf(Transforms.Gpu) },
+            .{ .binding = 1, .buffer = geom_uniform_buf, .size = @sizeOf(GeometryUniforms) },
         },
     }));
 
     const fullscreen_shader = mach.device.createShaderModuleWGSL("fullscreen.wgsl", @embedFile("shader/fullscreen.wgsl"));
     defer fullscreen_shader.release();
 
+    const shade_bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
+        .entries = &.{.{
+            .binding = 0,
+            .visibility = .{ .fragment = true },
+            .buffer = .{
+                .type = .uniform,
+                .min_binding_size = @sizeOf(Transforms.Gpu),
+            },
+        }},
+    }));
+    defer shade_bind_layout.release();
+
     const shade_layout = mach.device.createPipelineLayout(&gpu.PipelineLayout.Descriptor.init(.{
-        .bind_group_layouts = &.{ g_buffer_layout, material_store.bind_layout },
+        .bind_group_layouts = &.{
+            shade_bind_layout,
+            g_buffer_layout,
+            material_store.bind_layout,
+            light_store.bind_layout,
+        },
     }));
     defer shade_layout.release();
+
     const shade_pipe = mach.device.createRenderPipeline(&.{
         .layout = shade_layout,
 
@@ -407,6 +582,13 @@ pub fn init(world: *flecs.world_t) !void {
         }),
     });
     errdefer shade_pipe.release();
+
+    const shade_bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+        .layout = shade_pipe.getBindGroupLayout(0),
+        .entries = &.{
+            .{ .binding = 0, .buffer = trans_uniform_buf, .size = @sizeOf(Transforms.Gpu) },
+        },
+    }));
 
     const post, const post_bind_layout = DoubleBuffer.init();
     errdefer post.deinit();
@@ -438,39 +620,40 @@ pub fn init(world: *flecs.world_t) !void {
     });
     errdefer color_correct_pipe.release();
 
-    const mvp = a: {
-        const view = math.lookAtRh(
-            math.f32x4(0.5, 0.5, 0.5, 1),
-            math.f32x4(0, 0, 0, 1),
-            math.f32x4(0, 1, 0, 0),
-        );
-        const size = mach.size();
-        const width: f32 = @floatFromInt(size.width);
-        const height: f32 = @floatFromInt(size.height);
-        const proj = math.perspectiveFovRh(std.math.tau / 8.0, width / height, 0.1, 100);
-        break :a math.mul(view, proj);
-    };
+    flecs.COMPONENT(world, OpaqueMaterial);
+    flecs.COMPONENT(world, Geometry);
+    flecs.COMPONENT(world, light.Directional);
+
+    const light_query = try flecs.query_init(world, &a: {
+        var desc: flecs.query_desc_t = .{};
+        desc.filter.terms[0] = .{ .id = flecs.id(light.Directional) };
+        break :a desc;
+    });
+    errdefer flecs.query_fini(light_query);
 
     const ren = try mach.allocator.create(Renderer);
+    errdefer mach.allocator.destroy(ren);
     ren.* = .{
         .phase = flecs.new_w_id(world, flecs.Phase),
+        .light_query = light_query,
 
         .g_buffer = g_buffer,
         .material_store = material_store,
+        .light_store = light_store,
+
         .geom_pipe = geom_pipe,
-        .geom_uniform_buf = geom_uniform_buf,
-        .geom_uniform_bind = geom_uniform_bind,
+        .geom_bind = geom_bind,
         .shade_pipe = shade_pipe,
+        .shade_bind = shade_bind,
+
+        .trans = trans,
+        .trans_uniform_buf = trans_uniform_buf,
+        .geom_uniform_buf = geom_uniform_buf,
 
         .post = post,
         .color_correct_pipe = color_correct_pipe,
-
-        .mvp = mvp,
     };
-    errdefer deinit(ren);
-
-    flecs.COMPONENT(world, OpaqueMaterial);
-    flecs.COMPONENT(world, Geometry);
+    errdefer flecs.delete(world, ren.phase);
 
     // TODO: enforce strict ordering
     {
@@ -500,12 +683,24 @@ pub fn init(world: *flecs.world_t) !void {
 fn deinit(ctx: ?*anyopaque) callconv(.C) void {
     const ren: *Renderer = @ptrCast(@alignCast(ctx.?));
 
+    // TODO: delete phase entity (we don't store the world, but maybe we should)
+    // flecs.delete(world, ren.phase);
+    // TODO: delete query (causes a general protection fault atm, I guess the world is destroying it before we do)
+    // flecs.query_fini(ren.light_query);
+
     ren.g_buffer.depth.release();
     ren.g_buffer.normal_material.release();
+
     ren.material_store.deinit();
+    ren.light_store.deinit();
 
     ren.geom_pipe.release();
+    ren.geom_bind.release();
     ren.shade_pipe.release();
+    ren.shade_bind.release();
+
+    ren.trans_uniform_buf.release();
+    ren.geom_uniform_buf.release();
 
     ren.post.deinit();
     ren.color_correct_pipe.release();
@@ -538,11 +733,23 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
     const geom = flecs.field(it, Geometry, 2).?;
 
     // TODO: use events to update material store rather than re-uploading every time
-    ren.material_store.clearRetainingCapacity();
+    ren.material_store.clear();
     for (mat) |m| {
-        ren.material_store.append(m.toGpu()) catch @panic("OOM");
+        ren.material_store.append(m) catch @panic("OOM");
     }
     ren.material_store.upload();
+
+    // Update transforms
+    // TODO: cache
+    {
+        const vp = math.mul(ren.trans.view, ren.trans.proj);
+        const inv_vp = math.inverse(vp);
+        mach.queue.writeBuffer(ren.trans_uniform_buf, 0, &[_]Transforms.Gpu{.{
+            .view = ren.trans.view,
+            .vp = vp,
+            .inv_vp = inv_vp,
+        }});
+    }
 
     // Draw to g-buffer
     // TODO: batching
@@ -550,7 +757,6 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
         // TODO: cache uniform data
         mach.queue.writeBuffer(ren.geom_uniform_buf, 0, &[_]GeometryUniforms{.{
             .material_idx = @intCast(i),
-            .transform = ren.mvp,
         }});
 
         const encoder = mach.device.createCommandEncoder(null);
@@ -565,6 +771,7 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
             }},
             .depth_stencil_attachment = &.{
                 .view = ren.g_buffer.depth,
+                .depth_clear_value = 1,
                 .depth_load_op = if (i == 0) .clear else .load,
                 .depth_store_op = .store,
             },
@@ -572,7 +779,7 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
         defer pass.release();
 
         pass.setPipeline(ren.geom_pipe);
-        pass.setBindGroup(0, ren.geom_uniform_bind, &.{});
+        pass.setBindGroup(0, ren.geom_bind, &.{});
         pass.setIndexBuffer(g.index_buffer, .uint32, 0, g.index_count * @sizeOf(u32));
         pass.setVertexBuffer(0, g.pos_buffer, 0, g.vertex_count * 3 * @sizeOf(f32));
         pass.setVertexBuffer(1, g.normal_buffer, 0, g.vertex_count * 3 * @sizeOf(f32));
@@ -580,6 +787,20 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
         pass.end();
 
         mach.queue.submit(&.{encoder.finish(null)});
+    }
+
+    // TODO: use events
+    {
+        ren.light_store.clear();
+        var light_it = flecs.query_iter(it.world, ren.light_query);
+        while (flecs.query_next(&light_it)) {
+            const dir = flecs.field(&light_it, light.Directional, 1).?;
+            for (dir) |l| {
+                ren.light_store.append(l) catch @panic("OOM");
+            }
+        }
+
+        ren.light_store.upload();
     }
 
     // Shade drawn geometry
@@ -595,12 +816,17 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
         defer pass.release();
         ren.post.flip();
 
-        const bind = ren.material_store.bindGroup();
-        defer bind.release();
+        const mat_bind = ren.material_store.bindGroup();
+        defer mat_bind.release();
+
+        const light_bind = ren.light_store.bindGroup();
+        defer light_bind.release();
 
         pass.setPipeline(ren.shade_pipe);
-        pass.setBindGroup(0, ren.g_buffer.bind, null);
-        pass.setBindGroup(1, bind, null);
+        pass.setBindGroup(0, ren.shade_bind, null);
+        pass.setBindGroup(1, ren.g_buffer.bind, null);
+        pass.setBindGroup(2, mat_bind, null);
+        pass.setBindGroup(3, light_bind, null);
         pass.draw(3, 1, 0, 0);
         pass.end();
 
