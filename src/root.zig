@@ -34,6 +34,22 @@ pub const Engine = struct {
             });
         }
 
+        // Add random lights
+        var rand = std.rand.DefaultPrng.init(0);
+        const rng = rand.random();
+        for (0..100) |_| {
+            const light = try mod.newEntity();
+            try ren.set(light, .light_directional, .{
+                .color = .{ 10, 10, 10 },
+                .dir = math.normalize3(math.f32x4(
+                    rng.floatNorm(f32),
+                    rng.floatNorm(f32),
+                    rng.floatNorm(f32),
+                    0.0,
+                )),
+            });
+        }
+
         // Add camera
         {
             const cam = try mod.newEntity();

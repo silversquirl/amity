@@ -56,6 +56,10 @@ struct DirectionalLight {
     color: u32,
     dir: vec3<f32>,
 }
+struct DirectionalLightV {
+    @location(0) @interpolate(flat) color: u32,
+    @location(1) @interpolate(flat) dir: vec3<f32>,
+}
 
 // TODO: more light types
 // OPTIN: another approach to lighting occurs to me: draw an instance for every light and accumulate the results with blending.
@@ -70,26 +74,75 @@ struct DirectionalLight {
 const pi = radians(180.0);
 const ambient_strength = 0.05;
 
+// Ambient lighting shader (runs on G-Buffer)
+@fragment
+fn renderAmbient(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let data = sampleGBuf(frag_pos);
+    if data.material_id == 0 {
+        return vec4<f32>(0.0);
+    }
+    let mat = materials[data.material_id - 1];
+
+    let l0 = ambient_strength * unpackColor(mat.color);
+    return vec4<f32>(pi * l0, 1.0);
+}
+
+// Fullscreen shader for directional lighting
+@vertex
+fn vertexDirLights(@builtin(vertex_index) idx: u32, light: DirectionalLightV) -> DirLightsVertexOut {
+    let ipos = vec2<u32>(idx & 1, (idx >> 1) & 1);
+    let pos = vec4<f32>(
+        vec2<f32>(ipos) * 4.0 - 1.0,
+        0.0, 1.0,
+    );
+    return DirLightsVertexOut(pos, light.color, light.dir);
+}
+struct DirLightsVertexOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) @interpolate(flat) color: u32,
+    @location(1) @interpolate(flat) dir: vec3<f32>,
+}
+
+// Directional lighting shader (runs on G-Buffer)
+@fragment
+fn renderDirLights(@builtin(position) frag_pos: vec4<f32>, light: DirectionalLightV) -> @location(0) vec4<f32> {
+    let data = sampleGBuf(frag_pos);
+    if data.material_id == 0 {
+        return vec4<f32>(0.0);
+    }
+    let mat = materials[data.material_id - 1];
+
+    // Compute position of fragment in world space
+    let screen_size = vec2<f32>(textureDimensions(g_buffer).xy);
+    let clip_pos = vec3(frag_pos.xy, data.depth);
+    let view_pos = clip_pos * vec3<f32>(2.0 / screen_size, 1.0) - vec3<f32>(1.0, 1.0, 0.0);
+    let pos = trans.inv_vp * vec4<f32>(view_pos, 1.0);
+
+    // PBR lighting
+    let v = normalize(pos.xyz);
+    let dir = trans.view * vec4<f32>(light.dir, 0.0);
+    let c_light = unpackColor(light.color);
+    let l = normalize(dir.xyz);
+    let l0 = brdf(l, v, data.normal, mat) * c_light * max(dot(data.normal, l), 0.0);
+
+    return vec4<f32>(pi * l0, 1.0);
+}
+
 // Rendering shader (runs on G-Buffer)
 @fragment
 fn render(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let load_pos = vec2<u32>(frag_pos.xy);
-    let normal_material = textureLoad(g_buffer, load_pos, 0);
-
-    let material_id = normal_material.w;
-    if material_id == 0 {
+    let data = sampleGBuf(frag_pos);
+    if data.material_id == 0 {
         // OPTIM: check whether discard would be faster. then again we'll normally be rendering a skybox. And on that note...
         // TODO: sky material (or maybe it's faster to do that in a separate pass?)
         return vec4<f32>(0.0);
     }
 
-    let depth = textureLoad(depth_buffer, load_pos, 0);
-    let mat = materials[material_id - 1];
-    let normal = bitcast<vec3<f32>>(normal_material.xyz);
+    let mat = materials[data.material_id - 1];
 
     // Compute position of fragment in world space
     let screen_size = vec2<f32>(textureDimensions(g_buffer).xy);
-    let clip_pos = vec3(frag_pos.xy, depth);
+    let clip_pos = vec3(frag_pos.xy, data.depth);
     let view_pos = clip_pos * vec3<f32>(2.0 / screen_size, 1.0) - vec3<f32>(1.0, 1.0, 0.0);
     let pos = trans.inv_vp * vec4<f32>(view_pos, 1.0);
 
@@ -102,12 +155,26 @@ fn render(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
 
         let c_light = unpackColor(light.color);
         let l = normalize(dir.xyz);
-        l0 += brdf(l, v, normal, mat) * c_light * max(dot(normal, l), 0.0);
+        l0 += brdf(l, v, data.normal, mat) * c_light * max(dot(data.normal, l), 0.0);
     }
 
     return vec4<f32>(pi * l0, 1.0);
 }
 
+fn sampleGBuf(frag_pos: vec4<f32>) -> GBufferSample {
+    let load_pos = vec2<u32>(frag_pos.xy);
+    let normal_material = textureLoad(g_buffer, load_pos, 0);
+    return GBufferSample(
+        normal_material.w,
+        textureLoad(depth_buffer, load_pos, 0),
+        bitcast<vec3<f32>>(normal_material.xyz),
+    );
+}
+struct GBufferSample {
+    material_id: u32,
+    depth: f32,
+    normal: vec3<f32>,
+}
 
 fn brdf(l: vec3<f32>, v: vec3<f32>, normal: vec3<f32>, mat: Material) -> vec3<f32> {
     // Lambertian diffuse

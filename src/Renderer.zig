@@ -21,6 +21,8 @@ light_store: LightStore,
 geom_pipe: *gpu.RenderPipeline,
 geom_bind: *gpu.BindGroup,
 shade_pipe: *gpu.RenderPipeline,
+ambient_pipe: *gpu.RenderPipeline,
+directional_pipe: *gpu.RenderPipeline,
 shade_bind: *gpu.BindGroup,
 
 // TODO: use camera component
@@ -29,6 +31,17 @@ geom_uniform_buf: *gpu.Buffer,
 
 post: DoubleBuffer,
 color_correct_pipe: *gpu.RenderPipeline,
+
+deferred_render_mode: DeferredRenderMode = .storage,
+const DeferredRenderMode = enum {
+    storage,
+    instance,
+
+    pub fn cycle(m: *DeferredRenderMode) void {
+        m.* = @enumFromInt((@intFromEnum(m.*) +% 1) % std.enums.values(DeferredRenderMode).len);
+        log.debug("set deferred render mode to {s}", .{@tagName(m.*)});
+    }
+};
 
 // ECS module defs
 pub const name = .amity_renderer;
@@ -328,8 +341,8 @@ pub fn UploadBuffer(comptime T: type, comptime usage_: gpu.Buffer.UsageFlags) ty
         pub fn append(buf: *Self, item: T) !void {
             try buf.items.append(mach.allocator, item);
         }
-        pub fn len(buf: Self) usize {
-            return buf.items.items.len;
+        pub fn len(buf: Self) u32 {
+            return @intCast(buf.items.items.len);
         }
         pub fn byteSize(buf: Self) usize {
             return buf.len() * @sizeOf(T);
@@ -391,7 +404,7 @@ pub const MaterialStore = struct {
 
 pub const LightStore = struct {
     bind_layout: *gpu.BindGroupLayout,
-    dir: UploadBuffer(light.Directional.Gpu, .{ .storage = true }) = .{},
+    dir: UploadBuffer(light.Directional.Gpu, .{ .storage = true, .vertex = true }) = .{},
 
     pub fn init() LightStore {
         return .{
@@ -495,6 +508,11 @@ pub fn init(mod: *Mod) !void {
                     .array_stride = 3 * @sizeOf(f32),
                     .attributes = &.{
                         .{ .format = .float32x3, .offset = 0, .shader_location = 0 },
+                    },
+                }),
+                gpu.VertexBufferLayout.init(.{
+                    .array_stride = 3 * @sizeOf(f32),
+                    .attributes = &.{
                         .{ .format = .float32x3, .offset = 0, .shader_location = 1 },
                     },
                 }),
@@ -574,6 +592,66 @@ pub fn init(mod: *Mod) !void {
     });
     errdefer shade_pipe.release();
 
+    const instance_shade_layout = mach.device.createPipelineLayout(&gpu.PipelineLayout.Descriptor.init(.{
+        .bind_group_layouts = &.{
+            shade_bind_layout,
+            g_buffer_layout,
+            material_store.bind_layout,
+        },
+    }));
+    defer instance_shade_layout.release();
+
+    const instance_shade_target: mach.gpu.ColorTargetState = .{
+        .format = render_format,
+        .blend = &.{ .color = .{
+            .operation = .add,
+            .src_factor = .one,
+            .dst_factor = .one,
+        } },
+    };
+
+    const ambient_pipe = mach.device.createRenderPipeline(&.{
+        .layout = instance_shade_layout,
+
+        .vertex = gpu.VertexState.init(.{
+            .module = fullscreen_shader,
+            .entry_point = "vertex",
+        }),
+
+        .fragment = &gpu.FragmentState.init(.{
+            .module = deferred_shader,
+            .entry_point = "renderAmbient",
+            .targets = &.{instance_shade_target},
+        }),
+    });
+    errdefer ambient_pipe.release();
+
+    const directional_pipe = mach.device.createRenderPipeline(&.{
+        .layout = instance_shade_layout,
+
+        .vertex = gpu.VertexState.init(.{
+            .module = deferred_shader,
+            .entry_point = "vertexDirLights",
+            .buffers = &.{
+                gpu.VertexBufferLayout.init(.{
+                    .array_stride = @sizeOf(light.Directional.Gpu),
+                    .step_mode = .instance,
+                    .attributes = &.{
+                        .{ .format = .uint32, .offset = @offsetOf(light.Directional.Gpu, "color"), .shader_location = 0 },
+                        .{ .format = .float32x3, .offset = @offsetOf(light.Directional.Gpu, "dir"), .shader_location = 1 },
+                    },
+                }),
+            },
+        }),
+
+        .fragment = &gpu.FragmentState.init(.{
+            .module = deferred_shader,
+            .entry_point = "renderDirLights",
+            .targets = &.{instance_shade_target},
+        }),
+    });
+    errdefer directional_pipe.release();
+
     const shade_bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
         .layout = shade_pipe.getBindGroupLayout(0),
         .entries = &.{
@@ -619,6 +697,8 @@ pub fn init(mod: *Mod) !void {
         .geom_pipe = geom_pipe,
         .geom_bind = geom_bind,
         .shade_pipe = shade_pipe,
+        .ambient_pipe = ambient_pipe,
+        .directional_pipe = directional_pipe,
         .shade_bind = shade_bind,
 
         .trans_uniform_buf = trans_uniform_buf,
@@ -785,28 +865,65 @@ fn shadeOpaques(mod: *Mod) !void {
     const encoder = mach.device.createCommandEncoder(null);
     defer encoder.release();
 
-    const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
-        .color_attachments = &.{
-            ren.post.targetAttach(),
-        },
-    }));
-    defer pass.release();
-    ren.post.flip();
-
     const mat_bind = ren.material_store.bindGroup();
     defer mat_bind.release();
 
-    const light_bind = ren.light_store.bindGroup();
-    defer light_bind.release();
+    switch (ren.deferred_render_mode) {
+        .storage => {
+            const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
+                .color_attachments = &.{ren.post.targetAttach()},
+            }));
+            defer pass.release();
 
-    pass.setPipeline(ren.shade_pipe);
-    pass.setBindGroup(0, ren.shade_bind, null);
-    pass.setBindGroup(1, ren.g_buffer.bind, null);
-    pass.setBindGroup(2, mat_bind, null);
-    pass.setBindGroup(3, light_bind, null);
-    pass.draw(3, 1, 0, 0);
-    pass.end();
+            const light_bind = ren.light_store.bindGroup();
+            defer light_bind.release();
 
+            pass.setPipeline(ren.shade_pipe);
+            pass.setBindGroup(0, ren.shade_bind, null);
+            pass.setBindGroup(1, ren.g_buffer.bind, null);
+            pass.setBindGroup(2, mat_bind, null);
+            pass.setBindGroup(3, light_bind, null);
+            pass.draw(3, 1, 0, 0);
+            pass.end();
+        },
+
+        .instance => {
+            var target = ren.post.targetAttach();
+            {
+                const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
+                    .color_attachments = &.{target},
+                }));
+                defer pass.release();
+
+                pass.setPipeline(ren.ambient_pipe);
+                pass.setBindGroup(0, ren.shade_bind, null);
+                pass.setBindGroup(1, ren.g_buffer.bind, null);
+                pass.setBindGroup(2, mat_bind, null);
+                pass.draw(3, 1, 0, 0);
+                pass.end();
+            }
+
+            // We're blending, so don't clear!
+            target.load_op = .load;
+
+            if (ren.light_store.dir.len() > 0) {
+                const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
+                    .color_attachments = &.{target},
+                }));
+                defer pass.release();
+
+                pass.setPipeline(ren.directional_pipe);
+                pass.setBindGroup(0, ren.shade_bind, null);
+                pass.setBindGroup(1, ren.g_buffer.bind, null);
+                pass.setBindGroup(2, mat_bind, null);
+                pass.setVertexBuffer(0, ren.light_store.dir.buf.?, 0, ren.light_store.dir.byteSize());
+                pass.draw(3, ren.light_store.dir.len() - 1, 0, 0);
+                pass.end();
+            }
+        },
+    }
+
+    ren.post.flip();
     mach.queue.submit(&.{encoder.finish(null)});
 }
 
