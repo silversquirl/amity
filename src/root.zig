@@ -94,7 +94,7 @@ fn loadScene(ren: *Renderer.Mod, path: [:0]const u8) !void {
     };
     defer c.aiReleaseImport(scene);
 
-    const materials = try mach.allocator.alloc(Renderer.OpaqueMaterial, scene.*.mNumMaterials);
+    const materials = try mach.allocator.alloc(Renderer.Opaques.Material, scene.*.mNumMaterials);
     defer mach.allocator.free(materials);
     for (materials, scene.*.mMaterials) |*mat, ai_mat| {
         mat.color = a: {
