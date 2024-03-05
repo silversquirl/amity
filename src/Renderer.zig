@@ -20,8 +20,7 @@ light_store: LightStore = .{},
 
 geom_pipe: *gpu.RenderPipeline,
 geom_bind: *gpu.BindGroup,
-shade_pipe: *gpu.RenderPipeline,
-compute_pipe: *gpu.ComputePipeline,
+shade_pipe: *gpu.ComputePipeline,
 shade_bind: *gpu.BindGroup,
 shading_data_bind_layout: *gpu.BindGroupLayout,
 
@@ -31,17 +30,6 @@ geom_uniform_buf: *gpu.Buffer,
 
 post: DoubleBuffer,
 color_correct_pipe: *gpu.RenderPipeline,
-
-deferred_render_mode: DeferredRenderMode = .storage,
-const DeferredRenderMode = enum {
-    storage,
-    compute,
-
-    pub fn cycle(m: *DeferredRenderMode) void {
-        m.* = @enumFromInt((@intFromEnum(m.*) +% 1) % std.enums.values(DeferredRenderMode).len);
-        log.debug("set deferred render mode to {s}", .{@tagName(m.*)});
-    }
-};
 
 // ECS module defs
 pub const name = .amity_renderer;
@@ -562,35 +550,8 @@ pub fn init(mod: *Mod) !void {
     }));
     errdefer shading_data_bind_layout.release();
 
-    const shade_layout = mach.device.createPipelineLayout(&gpu.PipelineLayout.Descriptor.init(.{
-        .bind_group_layouts = &.{
-            shade_bind_layout,
-            g_buffer_layout,
-            shading_data_bind_layout,
-        },
-    }));
-    defer shade_layout.release();
-
-    const shade_pipe = mach.device.createRenderPipeline(&.{
-        .layout = shade_layout,
-
-        .vertex = gpu.VertexState.init(.{
-            .module = fullscreen_shader,
-            .entry_point = "vertex",
-        }),
-
-        .fragment = &gpu.FragmentState.init(.{
-            .module = deferred_shader,
-            .entry_point = "render",
-            .targets = &.{
-                .{ .format = render_format },
-            },
-        }),
-    });
-    errdefer shade_pipe.release();
-
     const shade_bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
-        .layout = shade_pipe.getBindGroupLayout(0),
+        .layout = shade_bind_layout,
         .entries = &.{
             .{ .binding = 0, .buffer = trans_uniform_buf, .size = @sizeOf(Transforms) },
         },
@@ -603,7 +564,7 @@ pub fn init(mod: *Mod) !void {
         post_storage_bind_layout.release();
     }
 
-    const compute_shade_layout = mach.device.createPipelineLayout(&gpu.PipelineLayout.Descriptor.init(.{
+    const shade_layout = mach.device.createPipelineLayout(&gpu.PipelineLayout.Descriptor.init(.{
         .bind_group_layouts = &.{
             shade_bind_layout,
             g_buffer_layout,
@@ -611,16 +572,16 @@ pub fn init(mod: *Mod) !void {
             post_storage_bind_layout,
         },
     }));
-    defer compute_shade_layout.release();
+    defer shade_layout.release();
 
-    const compute_pipe = mach.device.createComputePipeline(&.{
-        .layout = compute_shade_layout,
+    const shade_pipe = mach.device.createComputePipeline(&.{
+        .layout = shade_layout,
         .compute = mach.gpu.ProgrammableStageDescriptor.init(.{
             .module = deferred_shader,
-            .entry_point = "renderCompute",
+            .entry_point = "render",
         }),
     });
-    errdefer compute_pipe.release();
+    errdefer shade_pipe.release();
 
     const color_correct_shader = mach.device.createShaderModuleWGSL("color_correct.wgsl", @embedFile("shader/color_correct.wgsl"));
     defer color_correct_shader.release();
@@ -654,7 +615,6 @@ pub fn init(mod: *Mod) !void {
         .geom_pipe = geom_pipe,
         .geom_bind = geom_bind,
         .shade_pipe = shade_pipe,
-        .compute_pipe = compute_pipe,
         .shade_bind = shade_bind,
         .shading_data_bind_layout = shading_data_bind_layout,
 
@@ -818,10 +778,6 @@ fn shadeOpaques(mod: *Mod) !void {
     }
     try ren.light_store.upload();
 
-    // Shade drawn geometry
-    const encoder = mach.device.createCommandEncoder(null);
-    defer encoder.release();
-
     // TODO: caching
     const data_bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
         .layout = ren.shading_data_bind_layout,
@@ -832,42 +788,27 @@ fn shadeOpaques(mod: *Mod) !void {
     }));
     defer data_bind.release();
 
-    switch (ren.deferred_render_mode) {
-        .storage => {
-            const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
-                .color_attachments = &.{ren.post.targetAttach()},
-            }));
-            defer pass.release();
+    // Shade drawn geometry
+    const encoder = mach.device.createCommandEncoder(null);
+    defer encoder.release();
+    const pass = encoder.beginComputePass(null);
+    defer pass.release();
 
-            pass.setPipeline(ren.shade_pipe);
-            pass.setBindGroup(0, ren.shade_bind, null);
-            pass.setBindGroup(1, ren.g_buffer.bind, null);
-            pass.setBindGroup(2, data_bind, null);
-            pass.draw(3, 1, 0, 0);
-            pass.end();
-        },
+    pass.setPipeline(ren.shade_pipe);
+    pass.setBindGroup(0, ren.shade_bind, null);
+    pass.setBindGroup(1, ren.g_buffer.bind, null);
+    pass.setBindGroup(2, data_bind, null);
+    pass.setBindGroup(3, ren.post.targetBind(), null);
 
-        .compute => {
-            const pass = encoder.beginComputePass(null);
-            defer pass.release();
-
-            pass.setPipeline(ren.compute_pipe);
-            pass.setBindGroup(0, ren.shade_bind, null);
-            pass.setBindGroup(1, ren.g_buffer.bind, null);
-            pass.setBindGroup(2, data_bind, null);
-            pass.setBindGroup(3, ren.post.targetBind(), null);
-
-            const size = mach.size();
-            pass.dispatchWorkgroups(
-                (size.width - 1) / 8 + 1,
-                (size.height - 1) / 8 + 1,
-                1,
-            );
-            pass.end();
-        },
-    }
-
+    const size = mach.size();
+    pass.dispatchWorkgroups(
+        (size.width - 1) / 8 + 1,
+        (size.height - 1) / 8 + 1,
+        1,
+    );
+    pass.end();
     ren.post.flip();
+
     mach.queue.submit(&.{encoder.finish(null)});
 }
 

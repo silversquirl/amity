@@ -35,7 +35,6 @@ pub fn update(app: *App) !bool {
             switch (ev) {
                 .close => return true,
                 .key_press => |key| switch (key.key) {
-                    .m => app.world.mod.amity_renderer.state.deferred_render_mode.cycle(),
                     .v => {
                         const vsync: mach.VSyncMode = switch (mach.vsync()) {
                             .none => .triple,
@@ -49,9 +48,7 @@ pub fn update(app: *App) !bool {
                         // Run benchmark
                         app.bench = .{ .vsync = mach.vsync() };
                         mach.setVSync(.none);
-                        std.log.info("Starting benchmark in {s} mode", .{
-                            @tagName(app.world.mod.amity_renderer.state.deferred_render_mode),
-                        });
+                        std.log.info("Starting benchmark", .{});
                     },
 
                     .q => return true,
@@ -105,9 +102,7 @@ fn printBenchResults(app: *App) !void {
     std.debug.print("interquartile mean: {d:.4}ms\n", .{iqm * 1000.0});
 
     var buf: [256]u8 = undefined;
-    const filename = try std.fmt.bufPrint(&buf, "bench_{s}.npy", .{
-        @tagName(app.world.mod.amity_renderer.state.deferred_render_mode),
-    });
+    const filename = try std.fmt.bufPrint(&buf, "bench_{}.npy", .{std.time.timestamp()});
     const f = try std.fs.cwd().createFile(filename, .{});
     defer f.close();
 

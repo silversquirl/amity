@@ -66,50 +66,14 @@ struct DirectionalLight {
 @group(1) @binding(1) var g_buffer: texture_2d<u32>;
 @group(2) @binding(0) var<storage> materials: array<Material>;
 @group(2) @binding(1) var<storage> lights_dir: array<DirectionalLight>;
+@group(3) @binding(0) var output: texture_storage_2d<rgba16float, write>;
 
 const pi = radians(180.0);
 const ambient_strength = 0.05;
 
 // Rendering shader (runs on G-Buffer)
-@fragment
-fn render(@builtin(position) frag_pos: vec4<f32>) -> @location(0) vec4<f32> {
-    let load_pos = vec2<u32>(frag_pos.xy);
-    let normal_material = textureLoad(g_buffer, load_pos, 0);
-    let material_id = normal_material.w;
-    if material_id == 0 {
-        // OPTIM: check whether discard would be faster. then again we'll normally be rendering a skybox. And on that note...
-        // TODO: sky material (or maybe it's faster to do that in a separate pass?)
-        return vec4<f32>(0.0);
-    }
-    let mat = materials[material_id - 1];
-    let depth = textureLoad(depth_buffer, load_pos, 0);
-    let normal = bitcast<vec3<f32>>(normal_material.xyz);
-
-    // Compute position of fragment in world space
-    let screen_size = vec2<f32>(textureDimensions(g_buffer).xy);
-    let clip_pos = vec3(frag_pos.xy, depth);
-    let view_pos = clip_pos * vec3<f32>(2.0 / screen_size, 1.0) - vec3<f32>(1.0, 1.0, 0.0);
-    let pos = trans.inv_vp * vec4<f32>(view_pos, 1.0);
-
-    // PBR lighting
-    let v = normalize(pos.xyz);
-    var l0 = ambient_strength * unpackColor(mat.color);
-    for (var i: u32 = 0; i < arrayLength(&lights_dir) - 1; i += 1) {
-        let light = lights_dir[i];
-        let dir = trans.view * vec4<f32>(light.dir, 0.0);
-
-        let c_light = unpackColor(light.color);
-        let l = normalize(dir.xyz);
-        l0 += brdf(l, v, normal, mat) * c_light * max(dot(normal, l), 0.0);
-    }
-
-    return vec4<f32>(pi * l0, 1.0);
-}
-
-@group(3) @binding(0) var output: texture_storage_2d<rgba16float, write>;
-
 @compute @workgroup_size(8, 8)
-fn renderCompute(@builtin(global_invocation_id) id: vec3<u32>) {
+fn render(@builtin(global_invocation_id) id: vec3<u32>) {
     let normal_material = textureLoad(g_buffer, id.xy, 0);
     let material_id = normal_material.w;
     if material_id == 0 {
