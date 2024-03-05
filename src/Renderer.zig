@@ -3,6 +3,8 @@ const flecs = @import("flecs");
 const mach = @import("mach-core");
 const math = @import("zmath");
 
+const Camera = @import("Camera.zig");
+
 const gpu = mach.gpu;
 const log = std.log.scoped(.amity_render);
 
@@ -25,7 +27,6 @@ shade_pipe: *gpu.RenderPipeline,
 shade_bind: *gpu.BindGroup,
 
 // TODO: use camera component
-trans: Transforms,
 trans_uniform_buf: *gpu.Buffer,
 geom_uniform_buf: *gpu.Buffer,
 
@@ -203,15 +204,10 @@ const GBuffer = struct {
     }
 };
 
-const Transforms = struct {
-    view: math.Mat,
-    proj: math.Mat,
-
-    const Gpu = extern struct {
-        view: [4][4]f32 align(16),
-        vp: [4][4]f32 align(16),
-        inv_vp: [4][4]f32 align(16),
-    };
+const Transforms = extern struct {
+    view: [4][4]f32 align(16),
+    vp: [4][4]f32 align(16),
+    inv_vp: [4][4]f32 align(16),
 };
 const GeometryUniforms = extern struct {
     material_idx: u32,
@@ -459,7 +455,7 @@ pub fn init(world: *flecs.world_t) !void {
                 .visibility = .{ .vertex = true },
                 .buffer = .{
                     .type = .uniform,
-                    .min_binding_size = @sizeOf(Transforms.Gpu),
+                    .min_binding_size = @sizeOf(Transforms),
                 },
             },
             .{
@@ -510,22 +506,8 @@ pub fn init(world: *flecs.world_t) !void {
     });
     errdefer geom_pipe.release();
 
-    const trans: Transforms = .{
-        .view = math.lookAtRh(
-            math.f32x4(0.5, 0.5, 0.5, 1),
-            math.f32x4(0, 0, 0, 1),
-            math.f32x4(0, 1, 0, 0),
-        ),
-        .proj = a: {
-            const size = mach.size();
-            const width: f32 = @floatFromInt(size.width);
-            const height: f32 = @floatFromInt(size.height);
-            break :a math.perspectiveFovRh(std.math.tau / 8.0, width / height, 0.1, 100);
-        },
-    };
-
     const trans_uniform_buf = mach.device.createBuffer(&.{
-        .size = @sizeOf(Transforms.Gpu),
+        .size = @sizeOf(Transforms),
         .usage = .{ .copy_dst = true, .uniform = true },
     });
     const geom_uniform_buf = mach.device.createBuffer(&.{
@@ -535,7 +517,7 @@ pub fn init(world: *flecs.world_t) !void {
     const geom_bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
         .layout = geom_pipe.getBindGroupLayout(0),
         .entries = &.{
-            .{ .binding = 0, .buffer = trans_uniform_buf, .size = @sizeOf(Transforms.Gpu) },
+            .{ .binding = 0, .buffer = trans_uniform_buf, .size = @sizeOf(Transforms) },
             .{ .binding = 1, .buffer = geom_uniform_buf, .size = @sizeOf(GeometryUniforms) },
         },
     }));
@@ -549,7 +531,7 @@ pub fn init(world: *flecs.world_t) !void {
             .visibility = .{ .fragment = true },
             .buffer = .{
                 .type = .uniform,
-                .min_binding_size = @sizeOf(Transforms.Gpu),
+                .min_binding_size = @sizeOf(Transforms),
             },
         }},
     }));
@@ -586,7 +568,7 @@ pub fn init(world: *flecs.world_t) !void {
     const shade_bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
         .layout = shade_pipe.getBindGroupLayout(0),
         .entries = &.{
-            .{ .binding = 0, .buffer = trans_uniform_buf, .size = @sizeOf(Transforms.Gpu) },
+            .{ .binding = 0, .buffer = trans_uniform_buf, .size = @sizeOf(Transforms) },
         },
     }));
 
@@ -646,7 +628,6 @@ pub fn init(world: *flecs.world_t) !void {
         .shade_pipe = shade_pipe,
         .shade_bind = shade_bind,
 
-        .trans = trans,
         .trans_uniform_buf = trans_uniform_buf,
         .geom_uniform_buf = geom_uniform_buf,
 
@@ -654,6 +635,17 @@ pub fn init(world: *flecs.world_t) !void {
         .color_correct_pipe = color_correct_pipe,
     };
     errdefer flecs.delete(world, ren.phase);
+
+    {
+        var desc: flecs.observer_desc_t = .{
+            .callback = updateTransforms,
+            .ctx = ren,
+            .yield_existing = true,
+        };
+        desc.events[0] = flecs.OnSet;
+        desc.filter.terms[0] = .{ .id = flecs.id(Camera) };
+        _ = flecs.observer_init(world, &desc);
+    }
 
     // TODO: enforce strict ordering
     {
@@ -724,10 +716,29 @@ fn createSwapchainTexture(format: gpu.Texture.Format, usage: gpu.Texture.UsageFl
     return tex.createView(null);
 }
 
+//// GPU sync callbacks ////
+
+fn updateTransforms(it: *flecs.iter_t) callconv(.C) void {
+    const ren: *Renderer = @ptrCast(@alignCast(it.ctx.?));
+
+    for (flecs.field(it, Camera, 1).?) |cam| {
+        const view = cam.view();
+        const proj = cam.proj(mach.size());
+        const vp = math.mul(view, proj);
+        const inv_vp = math.inverse(vp);
+
+        mach.queue.writeBuffer(ren.trans_uniform_buf, 0, &[_]Transforms{.{
+            .view = view,
+            .vp = vp,
+            .inv_vp = inv_vp,
+        }});
+    }
+}
+
 //// Rendering phases ////
 
 fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
-    const ren: *Renderer = @ptrCast(@alignCast(it.param.?));
+    const ren: *Renderer = @ptrCast(@alignCast(it.ctx.?));
 
     const mat = flecs.field(it, OpaqueMaterial, 1).?;
     const geom = flecs.field(it, Geometry, 2).?;
@@ -738,18 +749,6 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
         ren.material_store.append(m) catch @panic("OOM");
     }
     ren.material_store.upload();
-
-    // Update transforms
-    // TODO: cache
-    {
-        const vp = math.mul(ren.trans.view, ren.trans.proj);
-        const inv_vp = math.inverse(vp);
-        mach.queue.writeBuffer(ren.trans_uniform_buf, 0, &[_]Transforms.Gpu{.{
-            .view = ren.trans.view,
-            .vp = vp,
-            .inv_vp = inv_vp,
-        }});
-    }
 
     // Draw to g-buffer
     // TODO: batching
@@ -835,7 +834,7 @@ fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
 }
 
 fn colorCorrect(it: *flecs.iter_t) callconv(.C) void {
-    const ren: *Renderer = @ptrCast(@alignCast(it.param.?));
+    const ren: *Renderer = @ptrCast(@alignCast(it.ctx.?));
 
     const dest = mach.swap_chain.getCurrentTextureView().?;
     defer dest.release();

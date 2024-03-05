@@ -8,6 +8,7 @@ const c = @cImport({
     @cInclude("assimp/postprocess.h");
 });
 
+const Camera = @import("Camera.zig");
 const Renderer = @import("Renderer.zig");
 
 pub const Engine = struct {
@@ -20,6 +21,8 @@ pub const Engine = struct {
     pub fn init(opts: InitOptions) !Engine {
         const world = flecs.init();
         errdefer _ = flecs.fini(world);
+
+        flecs.COMPONENT(world, Camera);
 
         if (opts.renderer) {
             try Renderer.init(world);
@@ -37,6 +40,22 @@ pub const Engine = struct {
             });
         }
 
+        // Add camera
+        {
+            const cam = flecs.new_entity(world, "Camera");
+            _ = flecs.set(world, cam, Camera, .{
+                .pos = .{ 0.5, 0.5, 0.5 },
+            });
+        }
+
+        // Spin camera
+        {
+            var desc: flecs.system_desc_t = .{ .callback = spinCamera };
+            desc.query.filter.terms[0] = .{ .id = flecs.id(Camera) };
+
+            flecs.SYSTEM(world, "amity/camera", flecs.OnUpdate, &desc);
+        }
+
         _ = flecs.progress(world, 0);
         return .{
             .world = world,
@@ -48,9 +67,24 @@ pub const Engine = struct {
     }
 
     pub fn update(eng: *Engine, dt: f32) !bool {
+        var corrected_dt = dt;
+        if (dt == 0) {
+            std.log.debug("zero dt, correcting to small value", .{});
+            corrected_dt = std.math.floatEps(f32);
+        }
         return !flecs.progress(eng.world, dt);
     }
 };
+
+fn spinCamera(it: *flecs.iter_t) callconv(.C) void {
+    const dt = it.delta_time;
+    const q = math.quatFromNormAxisAngle(math.f32x4(0, 1, 0, 0), dt * std.math.tau / 8);
+    for (flecs.field(it, Camera, 1).?, it.entities()) |cam, e| {
+        var new = cam;
+        math.storeArr3(&new.pos, math.rotate(q, math.loadArr3(cam.pos)));
+        _ = flecs.set(it.world, e, Camera, new);
+    }
+}
 
 fn loadScene(world: *flecs.world_t, path: [:0]const u8) !void {
     const scene = c.aiImportFile(
