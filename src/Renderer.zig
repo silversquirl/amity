@@ -22,6 +22,9 @@ geom_pipe: *gpu.RenderPipeline,
 geom_bind: *gpu.BindGroup,
 shade_pipe: *gpu.RenderPipeline,
 compute_pipe: *gpu.ComputePipeline,
+compute_ambient_pipe: *gpu.ComputePipeline,
+compute_directional_pipe: *gpu.ComputePipeline,
+compute_composite_pipe: *gpu.ComputePipeline,
 shade_bind: *gpu.BindGroup,
 shading_data_bind_layout: *gpu.BindGroupLayout,
 
@@ -36,6 +39,7 @@ deferred_render_mode: DeferredRenderMode = .storage,
 const DeferredRenderMode = enum {
     storage,
     compute,
+    compute_split,
 
     pub fn cycle(m: *DeferredRenderMode) void {
         m.* = @enumFromInt((@intFromEnum(m.*) +% 1) % std.enums.values(DeferredRenderMode).len);
@@ -543,14 +547,21 @@ pub fn init(mod: *Mod) !void {
     defer fullscreen_shader.release();
 
     const shade_bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
-        .entries = &.{.{
-            .binding = 0,
-            .visibility = .{ .fragment = true, .compute = true },
-            .buffer = .{
-                .type = .uniform,
-                .min_binding_size = @sizeOf(Transforms),
+        .entries = &.{
+            .{
+                .binding = 0,
+                .visibility = .{ .fragment = true, .compute = true },
+                .buffer = .{
+                    .type = .uniform,
+                    .min_binding_size = @sizeOf(Transforms),
+                },
             },
-        }},
+            .{
+                .binding = 1,
+                .visibility = .{ .compute = true },
+                .buffer = .{ .type = .storage },
+            },
+        },
     }));
     defer shade_bind_layout.release();
 
@@ -589,10 +600,19 @@ pub fn init(mod: *Mod) !void {
     });
     errdefer shade_pipe.release();
 
+    const size = mach.size();
+    const staging_buf_size = size.width * size.height * 2 * @sizeOf(u32);
+    const staging_buf = mach.device.createBuffer(&.{
+        .usage = .{ .storage = true },
+        .size = staging_buf_size,
+    });
+    defer staging_buf.release();
+
     const shade_bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
         .layout = shade_pipe.getBindGroupLayout(0),
         .entries = &.{
             .{ .binding = 0, .buffer = trans_uniform_buf, .size = @sizeOf(Transforms) },
+            .{ .binding = 1, .buffer = staging_buf, .size = staging_buf_size },
         },
     }));
 
@@ -621,6 +641,33 @@ pub fn init(mod: *Mod) !void {
         }),
     });
     errdefer compute_pipe.release();
+
+    const compute_ambient_pipe = mach.device.createComputePipeline(&.{
+        .layout = shade_layout,
+        .compute = mach.gpu.ProgrammableStageDescriptor.init(.{
+            .module = deferred_shader,
+            .entry_point = "renderAmbientCompute",
+        }),
+    });
+    errdefer compute_ambient_pipe.release();
+
+    const compute_directional_pipe = mach.device.createComputePipeline(&.{
+        .layout = shade_layout,
+        .compute = mach.gpu.ProgrammableStageDescriptor.init(.{
+            .module = deferred_shader,
+            .entry_point = "renderDirectionalCompute",
+        }),
+    });
+    errdefer compute_directional_pipe.release();
+
+    const compute_composite_pipe = mach.device.createComputePipeline(&.{
+        .layout = compute_shade_layout,
+        .compute = mach.gpu.ProgrammableStageDescriptor.init(.{
+            .module = deferred_shader,
+            .entry_point = "compositeCompute",
+        }),
+    });
+    errdefer compute_composite_pipe.release();
 
     const color_correct_shader = mach.device.createShaderModuleWGSL("color_correct.wgsl", @embedFile("shader/color_correct.wgsl"));
     defer color_correct_shader.release();
@@ -655,6 +702,9 @@ pub fn init(mod: *Mod) !void {
         .geom_bind = geom_bind,
         .shade_pipe = shade_pipe,
         .compute_pipe = compute_pipe,
+        .compute_ambient_pipe = compute_ambient_pipe,
+        .compute_directional_pipe = compute_directional_pipe,
+        .compute_composite_pipe = compute_composite_pipe,
         .shade_bind = shade_bind,
         .shading_data_bind_layout = shading_data_bind_layout,
 
@@ -864,6 +914,63 @@ fn shadeOpaques(mod: *Mod) !void {
                 1,
             );
             pass.end();
+        },
+
+        .compute_split => {
+            {
+                const pass = encoder.beginComputePass(null);
+                defer pass.release();
+
+                pass.setPipeline(ren.compute_ambient_pipe);
+                pass.setBindGroup(0, ren.shade_bind, null);
+                pass.setBindGroup(1, ren.g_buffer.bind, null);
+                pass.setBindGroup(2, data_bind, null);
+
+                const size = mach.size();
+                pass.dispatchWorkgroups(
+                    (size.width - 1) / 8 + 1,
+                    (size.height - 1) / 8 + 1,
+                    1,
+                );
+                pass.end();
+            }
+
+            {
+                const pass = encoder.beginComputePass(null);
+                defer pass.release();
+
+                pass.setPipeline(ren.compute_directional_pipe);
+                pass.setBindGroup(0, ren.shade_bind, null);
+                pass.setBindGroup(1, ren.g_buffer.bind, null);
+                pass.setBindGroup(2, data_bind, null);
+
+                const size = mach.size();
+                pass.dispatchWorkgroups(
+                    (size.width - 1) / 8 + 1,
+                    (size.height - 1) / 8 + 1,
+                    ren.light_store.dir.len(),
+                );
+                pass.end();
+            }
+
+            {
+                const pass = encoder.beginComputePass(null);
+                defer pass.release();
+
+                pass.setPipeline(ren.compute_composite_pipe);
+                pass.setBindGroup(0, ren.shade_bind, null);
+                pass.setBindGroup(1, ren.g_buffer.bind, null);
+                pass.setBindGroup(2, data_bind, null);
+                pass.setBindGroup(3, ren.post.targetBind(), null);
+
+                const size = mach.size();
+                pass.dispatchWorkgroups(
+                    (size.width - 1) / 8 + 1,
+                    (size.height - 1) / 8 + 1,
+                    1,
+                );
+                pass.end();
+            }
         },
     }
 
