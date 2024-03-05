@@ -1,6 +1,6 @@
 pub const std = @import("std");
 const flecs = @import("flecs");
-const mach = @import("mach-core");
+const mach = @import("mach").core;
 const math = @import("zmath");
 
 pos: [3]f32,

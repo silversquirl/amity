@@ -1,5 +1,5 @@
 const std = @import("std");
-const mach_core = @import("mach_core");
+const mach = @import("mach");
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
@@ -10,11 +10,15 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     };
     const deps = .{
-        .mach = b.dependency("mach_core", opts),
+        .mach = b.dependency("mach", .{
+            .target = target,
+            .optimize = optimize,
+            // .core = true, // TODO: waiting for mach build improvements
+        }),
         .assimp = b.dependency("assimp", .{
             .target = target,
             .optimize = optimize,
-            .formats = @as([]const u8, "Obj,STL,Ply"),
+            .formats = @as([]const u8, "Obj,STL,Ply,glTF,glTF2"),
         }),
         .zflecs = b.dependency("zflecs", opts),
         .zmath = b.dependency("zmath", opts),
@@ -25,12 +29,12 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
-    amity.addImport("mach-core", deps.mach.module("mach-core"));
+    amity.addImport("mach", deps.mach.module("mach"));
     amity.addImport("flecs", deps.zflecs.module("zflecs"));
     amity.addImport("zmath", deps.zmath.module("zmath"));
     amity.linkLibrary(deps.assimp.artifact("assimp"));
 
-    const app = try mach_core.App.init(b, deps.mach.builder, .{
+    const app = try mach.CoreApp.init(b, deps.mach.builder, .{
         .name = "amity",
         .src = "src/main.zig",
         .target = target,
@@ -38,6 +42,7 @@ pub fn build(b: *std.Build) !void {
         .deps = &.{
             .{ .name = "amity", .module = amity },
         },
+        .platform = null,
     });
     if (b.args) |args| {
         app.run.addArgs(args);

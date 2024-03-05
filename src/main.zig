@@ -1,6 +1,6 @@
 const std = @import("std");
 const amity = @import("amity");
-const mach = @import("mach-core");
+const mach = @import("mach").core;
 
 pub const App = @This();
 
