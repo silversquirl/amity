@@ -29,6 +29,7 @@ pub fn update(app: *App) !bool {
             app.bench = null;
         };
     } else {
+        // TODO: send events to the ECS
         var events = mach.pollEvents();
         while (events.next()) |ev| {
             switch (ev) {
@@ -52,6 +53,8 @@ pub fn update(app: *App) !bool {
                             @tagName(app.world.mod.amity_renderer.state.deferred_render_mode),
                         });
                     },
+
+                    .q => return true,
 
                     else => {},
                 },
