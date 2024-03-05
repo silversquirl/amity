@@ -1,14 +1,19 @@
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-instance = np.load("zig-out/bin/bench_instance.npy")
-storage = np.load("zig-out/bin/bench_storage.npy")
+data_dir = "zig-out/bin"
 
+data = {}
 outliers = 10
-instance = instance[outliers:-outliers]
-storage = storage[outliers:-outliers]
+for path in os.listdir(data_dir):
+    if path.endswith(".npy"):
+        d = np.load(os.path.join(data_dir, path))
+        d = d[outliers:-outliers]
+        data[os.path.basename(path)] = d
 
-plt.hist(instance, bins=1000, label="instance", histtype="step")
-plt.hist(storage, bins=1000, label="storage", histtype="step")
+
+for name, d in data.items():
+    plt.hist(d, bins=1000, label=name, histtype="step")
 plt.legend()
 plt.show()

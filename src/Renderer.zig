@@ -15,15 +15,17 @@ const log = std.log.scoped(.amity_render);
 //       Rendering systems can then use those entities to do rendering in a completely modular way
 
 g_buffer: GBuffer,
-material_store: MaterialStore,
-light_store: LightStore,
+material_store: MaterialStore = .{},
+light_store: LightStore = .{},
 
 geom_pipe: *gpu.RenderPipeline,
 geom_bind: *gpu.BindGroup,
 shade_pipe: *gpu.RenderPipeline,
 ambient_pipe: *gpu.RenderPipeline,
 directional_pipe: *gpu.RenderPipeline,
+compute_pipe: *gpu.ComputePipeline,
 shade_bind: *gpu.BindGroup,
+shading_data_bind_layout: *gpu.BindGroupLayout,
 
 // TODO: use camera component
 trans_uniform_buf: *gpu.Buffer,
@@ -36,6 +38,7 @@ deferred_render_mode: DeferredRenderMode = .storage,
 const DeferredRenderMode = enum {
     storage,
     instance,
+    compute,
 
     pub fn cycle(m: *DeferredRenderMode) void {
         m.* = @enumFromInt((@intFromEnum(m.*) +% 1) % std.enums.values(DeferredRenderMode).len);
@@ -191,12 +194,12 @@ const GBuffer = struct {
             .entries = &.{
                 .{
                     .binding = 0,
-                    .visibility = .{ .fragment = true },
+                    .visibility = .{ .fragment = true, .compute = true },
                     .texture = .{ .sample_type = .depth },
                 },
                 .{
                     .binding = 1,
-                    .visibility = .{ .fragment = true },
+                    .visibility = .{ .fragment = true, .compute = true },
                     .texture = .{ .sample_type = .uint },
                 },
             },
@@ -238,25 +241,42 @@ const GeometryUniforms = extern struct {
 const DoubleBuffer = struct {
     attach: [2]gpu.RenderPassColorAttachment,
     bind: [2]*gpu.BindGroup,
+    storage_bind: [2]*gpu.BindGroup,
     idx: u1 = 0,
 
-    fn init() struct { DoubleBuffer, *gpu.BindGroupLayout } {
+    fn init() struct { DoubleBuffer, *gpu.BindGroupLayout, *gpu.BindGroupLayout } {
         const bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
             .entries = &.{
                 .{
                     .binding = 0,
-                    .visibility = .{ .fragment = true },
+                    .visibility = .{ .fragment = true, .compute = true },
                     .texture = .{ .sample_type = .float },
+                },
+            },
+        }));
+
+        const storage_bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
+            .entries = &.{
+                .{
+                    .binding = 0,
+                    .visibility = .{ .compute = true },
+                    .storage_texture = .{
+                        .access = .write_only,
+                        .format = render_format,
+                        .view_dimension = .dimension_2d,
+                    },
                 },
             },
         }));
 
         var attach: [2]gpu.RenderPassColorAttachment = undefined;
         var bind: [2]*gpu.BindGroup = undefined;
-        for (&attach, &bind) |*a, *b| {
+        var storage_bind: [2]*gpu.BindGroup = undefined;
+        for (&attach, &bind, &storage_bind) |*a, *b, *sb| {
             const tex = createSwapchainTexture(render_format, .{
                 .render_attachment = true,
                 .texture_binding = true,
+                .storage_binding = true,
             });
 
             a.* = .{
@@ -272,9 +292,20 @@ const DoubleBuffer = struct {
                     .{ .binding = 0, .texture_view = tex, .size = 0 },
                 },
             }));
+
+            sb.* = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+                .layout = storage_bind_layout,
+                .entries = &.{
+                    .{ .binding = 0, .texture_view = tex, .size = 0 },
+                },
+            }));
         }
 
-        return .{ .{ .attach = attach, .bind = bind }, bind_layout };
+        return .{
+            .{ .attach = attach, .bind = bind, .storage_bind = storage_bind },
+            bind_layout,
+            storage_bind_layout,
+        };
     }
 
     fn deinit(buf: DoubleBuffer) void {
@@ -289,6 +320,9 @@ const DoubleBuffer = struct {
     }
     fn targetAttach(buf: DoubleBuffer) gpu.RenderPassColorAttachment {
         return buf.attach[buf.idx];
+    }
+    fn targetBind(buf: DoubleBuffer) *gpu.BindGroup {
+        return buf.storage_bind[buf.idx];
     }
     fn sourceBind(buf: DoubleBuffer) *gpu.BindGroup {
         return buf.bind[1 - buf.idx];
@@ -355,43 +389,25 @@ pub fn UploadBuffer(comptime T: type, comptime usage_: gpu.Buffer.UsageFlags) ty
 }
 
 pub const MaterialStore = struct {
-    bind_layout: *gpu.BindGroupLayout,
     buf: UploadBuffer(OpaqueMaterial.Gpu, .{ .storage = true }) = .{},
 
-    pub fn init() MaterialStore {
+    pub fn bindGroupLayoutEntry(binding: u32) gpu.BindGroupLayout.Entry {
         return .{
-            .bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
-                .entries = &.{
-                    .{
-                        .binding = 0,
-                        .visibility = .{ .fragment = true },
-                        .buffer = .{
-                            .type = .read_only_storage,
-                            .min_binding_size = 0,
-                        },
-                    },
-                },
-            })),
+            .binding = binding,
+            .visibility = .{ .fragment = true, .compute = true },
+            .buffer = .{
+                .type = .read_only_storage,
+                .min_binding_size = 0,
+            },
         };
     }
 
     pub fn deinit(store: *MaterialStore) void {
-        store.bind_layout.release();
         store.buf.deinit();
     }
 
     pub fn upload(store: *MaterialStore) void {
         store.buf.upload();
-    }
-
-    pub fn bindGroup(store: *MaterialStore) *gpu.BindGroup {
-        // TODO: caching
-        return mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
-            .layout = store.bind_layout,
-            .entries = &.{
-                store.buf.bindGroupEntry(0),
-            },
-        }));
     }
 
     pub fn clear(store: *MaterialStore) void {
@@ -403,28 +419,20 @@ pub const MaterialStore = struct {
 };
 
 pub const LightStore = struct {
-    bind_layout: *gpu.BindGroupLayout,
     dir: UploadBuffer(light.Directional.Gpu, .{ .storage = true, .vertex = true }) = .{},
 
-    pub fn init() LightStore {
+    pub fn bindGroupLayoutEntry(binding: u32) gpu.BindGroupLayout.Entry {
         return .{
-            .bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
-                .entries = &.{
-                    .{
-                        .binding = 0,
-                        .visibility = .{ .fragment = true },
-                        .buffer = .{
-                            .type = .read_only_storage,
-                            .min_binding_size = 0,
-                        },
-                    },
-                },
-            })),
+            .binding = binding,
+            .visibility = .{ .fragment = true, .compute = true },
+            .buffer = .{
+                .type = .read_only_storage,
+                .min_binding_size = 0,
+            },
         };
     }
 
     pub fn deinit(store: *LightStore) void {
-        store.bind_layout.release();
         store.dir.deinit();
     }
 
@@ -434,16 +442,6 @@ pub const LightStore = struct {
         try store.dir.append(undefined);
 
         store.dir.upload();
-    }
-
-    pub fn bindGroup(store: *LightStore) *gpu.BindGroup {
-        // TODO: caching
-        return mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
-            .layout = store.bind_layout,
-            .entries = &.{
-                store.dir.bindGroupEntry(0),
-            },
-        }));
     }
 
     pub fn clear(store: *LightStore) void {
@@ -461,11 +459,6 @@ pub fn init(mod: *Mod) !void {
     const g_buffer, const g_buffer_layout = GBuffer.init();
     errdefer g_buffer.deinit();
     defer g_buffer_layout.release();
-
-    var material_store = MaterialStore.init();
-    errdefer material_store.deinit();
-    var light_store = LightStore.init();
-    errdefer light_store.deinit();
 
     const deferred_shader = mach.device.createShaderModuleWGSL("deferred.wgsl", @embedFile("shader/deferred.wgsl"));
     defer deferred_shader.release();
@@ -555,7 +548,7 @@ pub fn init(mod: *Mod) !void {
     const shade_bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
         .entries = &.{.{
             .binding = 0,
-            .visibility = .{ .fragment = true },
+            .visibility = .{ .fragment = true, .compute = true },
             .buffer = .{
                 .type = .uniform,
                 .min_binding_size = @sizeOf(Transforms),
@@ -564,12 +557,19 @@ pub fn init(mod: *Mod) !void {
     }));
     defer shade_bind_layout.release();
 
+    const shading_data_bind_layout = mach.device.createBindGroupLayout(&gpu.BindGroupLayout.Descriptor.init(.{
+        .entries = &.{
+            MaterialStore.bindGroupLayoutEntry(0),
+            LightStore.bindGroupLayoutEntry(1),
+        },
+    }));
+    errdefer shading_data_bind_layout.release();
+
     const shade_layout = mach.device.createPipelineLayout(&gpu.PipelineLayout.Descriptor.init(.{
         .bind_group_layouts = &.{
             shade_bind_layout,
             g_buffer_layout,
-            material_store.bind_layout,
-            light_store.bind_layout,
+            shading_data_bind_layout,
         },
     }));
     defer shade_layout.release();
@@ -596,7 +596,7 @@ pub fn init(mod: *Mod) !void {
         .bind_group_layouts = &.{
             shade_bind_layout,
             g_buffer_layout,
-            material_store.bind_layout,
+            shading_data_bind_layout,
         },
     }));
     defer instance_shade_layout.release();
@@ -659,9 +659,31 @@ pub fn init(mod: *Mod) !void {
         },
     }));
 
-    const post, const post_bind_layout = DoubleBuffer.init();
+    const post, const post_bind_layout, const post_storage_bind_layout = DoubleBuffer.init();
     errdefer post.deinit();
-    defer post_bind_layout.release();
+    defer {
+        post_bind_layout.release();
+        post_storage_bind_layout.release();
+    }
+
+    const compute_shade_layout = mach.device.createPipelineLayout(&gpu.PipelineLayout.Descriptor.init(.{
+        .bind_group_layouts = &.{
+            shade_bind_layout,
+            g_buffer_layout,
+            shading_data_bind_layout,
+            post_storage_bind_layout,
+        },
+    }));
+    defer compute_shade_layout.release();
+
+    const compute_pipe = mach.device.createComputePipeline(&.{
+        .layout = compute_shade_layout,
+        .compute = mach.gpu.ProgrammableStageDescriptor.init(.{
+            .module = deferred_shader,
+            .entry_point = "renderCompute",
+        }),
+    });
+    errdefer compute_pipe.release();
 
     const color_correct_shader = mach.device.createShaderModuleWGSL("color_correct.wgsl", @embedFile("shader/color_correct.wgsl"));
     defer color_correct_shader.release();
@@ -691,15 +713,15 @@ pub fn init(mod: *Mod) !void {
 
     mod.state = .{
         .g_buffer = g_buffer,
-        .material_store = material_store,
-        .light_store = light_store,
 
         .geom_pipe = geom_pipe,
         .geom_bind = geom_bind,
         .shade_pipe = shade_pipe,
         .ambient_pipe = ambient_pipe,
         .directional_pipe = directional_pipe,
+        .compute_pipe = compute_pipe,
         .shade_bind = shade_bind,
+        .shading_data_bind_layout = shading_data_bind_layout,
 
         .trans_uniform_buf = trans_uniform_buf,
         .geom_uniform_buf = geom_uniform_buf,
@@ -865,8 +887,15 @@ fn shadeOpaques(mod: *Mod) !void {
     const encoder = mach.device.createCommandEncoder(null);
     defer encoder.release();
 
-    const mat_bind = ren.material_store.bindGroup();
-    defer mat_bind.release();
+    // TODO: caching
+    const data_bind = mach.device.createBindGroup(&gpu.BindGroup.Descriptor.init(.{
+        .layout = ren.shading_data_bind_layout,
+        .entries = &.{
+            ren.material_store.buf.bindGroupEntry(0),
+            ren.light_store.dir.bindGroupEntry(1),
+        },
+    }));
+    defer data_bind.release();
 
     switch (ren.deferred_render_mode) {
         .storage => {
@@ -875,14 +904,10 @@ fn shadeOpaques(mod: *Mod) !void {
             }));
             defer pass.release();
 
-            const light_bind = ren.light_store.bindGroup();
-            defer light_bind.release();
-
             pass.setPipeline(ren.shade_pipe);
             pass.setBindGroup(0, ren.shade_bind, null);
             pass.setBindGroup(1, ren.g_buffer.bind, null);
-            pass.setBindGroup(2, mat_bind, null);
-            pass.setBindGroup(3, light_bind, null);
+            pass.setBindGroup(2, data_bind, null);
             pass.draw(3, 1, 0, 0);
             pass.end();
         },
@@ -898,7 +923,7 @@ fn shadeOpaques(mod: *Mod) !void {
                 pass.setPipeline(ren.ambient_pipe);
                 pass.setBindGroup(0, ren.shade_bind, null);
                 pass.setBindGroup(1, ren.g_buffer.bind, null);
-                pass.setBindGroup(2, mat_bind, null);
+                pass.setBindGroup(2, data_bind, null);
                 pass.draw(3, 1, 0, 0);
                 pass.end();
             }
@@ -915,11 +940,30 @@ fn shadeOpaques(mod: *Mod) !void {
                 pass.setPipeline(ren.directional_pipe);
                 pass.setBindGroup(0, ren.shade_bind, null);
                 pass.setBindGroup(1, ren.g_buffer.bind, null);
-                pass.setBindGroup(2, mat_bind, null);
+                pass.setBindGroup(2, data_bind, null);
                 pass.setVertexBuffer(0, ren.light_store.dir.buf.?, 0, ren.light_store.dir.byteSize());
                 pass.draw(3, ren.light_store.dir.len() - 1, 0, 0);
                 pass.end();
             }
+        },
+
+        .compute => {
+            const pass = encoder.beginComputePass(null);
+            defer pass.release();
+
+            pass.setPipeline(ren.compute_pipe);
+            pass.setBindGroup(0, ren.shade_bind, null);
+            pass.setBindGroup(1, ren.g_buffer.bind, null);
+            pass.setBindGroup(2, data_bind, null);
+            pass.setBindGroup(3, ren.post.targetBind(), null);
+
+            const size = mach.size();
+            pass.dispatchWorkgroups(
+                (size.width - 1) / 8 + 1,
+                (size.height - 1) / 8 + 1,
+                1,
+            );
+            pass.end();
         },
     }
 
