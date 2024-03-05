@@ -1,9 +1,10 @@
 const std = @import("std");
-const flecs = @import("flecs");
+const ecs = @import("mach").ecs;
 const mach = @import("mach").core;
 const math = @import("zmath");
 
-const Camera = @import("Camera.zig");
+const amity = @import("root.zig");
+pub const Camera = @import("Camera.zig");
 
 const gpu = mach.gpu;
 const log = std.log.scoped(.amity_render);
@@ -12,10 +13,6 @@ const log = std.log.scoped(.amity_render);
 //        - Postprocessor: contains post-processing data such as attachment double-buffer and post-processing vertex shader
 //        - do we need more? probably
 //       Rendering systems can then use those entities to do rendering in a completely modular way
-
-const Renderer = @This();
-phase: flecs.entity_t,
-light_query: *flecs.query_t,
 
 g_buffer: GBuffer,
 material_store: MaterialStore,
@@ -32,6 +29,18 @@ geom_uniform_buf: *gpu.Buffer,
 
 post: DoubleBuffer,
 color_correct_pipe: *gpu.RenderPipeline,
+
+// ECS module defs
+pub const name = .amity_renderer;
+pub const components = struct {
+    // Add this component if the entity needs re-uploaded to the GPU
+    pub const dirty = void;
+    pub const camera = Camera;
+    pub const opaque_material = OpaqueMaterial;
+    pub const geometry = Geometry;
+    pub const light_directional = light.Directional;
+};
+pub const Mod = amity.World.Mod(@This());
 
 // Texture format used for HDR color buffers within the render pipeline
 const render_format: gpu.Texture.Format = .rgba16_float;
@@ -406,10 +415,10 @@ pub const LightStore = struct {
         store.dir.deinit();
     }
 
-    pub fn upload(store: *LightStore) void {
+    pub fn upload(store: *LightStore) !void {
         // WebGPU requires buffer bindings be non-empty, which requires a dummy value for empty buffers.
         // For simplicity, we add one to the end of all buffers, not just empty ones.
-        store.dir.append(undefined) catch @panic("OOM");
+        try store.dir.append(undefined);
 
         store.dir.upload();
     }
@@ -435,7 +444,7 @@ pub const LightStore = struct {
     }
 };
 
-pub fn init(world: *flecs.world_t) !void {
+pub fn init(mod: *Mod) !void {
     const g_buffer, const g_buffer_layout = GBuffer.init();
     errdefer g_buffer.deinit();
     defer g_buffer_layout.release();
@@ -602,23 +611,7 @@ pub fn init(world: *flecs.world_t) !void {
     });
     errdefer color_correct_pipe.release();
 
-    flecs.COMPONENT(world, OpaqueMaterial);
-    flecs.COMPONENT(world, Geometry);
-    flecs.COMPONENT(world, light.Directional);
-
-    const light_query = try flecs.query_init(world, &a: {
-        var desc: flecs.query_desc_t = .{};
-        desc.filter.terms[0] = .{ .id = flecs.id(light.Directional) };
-        break :a desc;
-    });
-    errdefer flecs.query_fini(light_query);
-
-    const ren = try mach.allocator.create(Renderer);
-    errdefer mach.allocator.destroy(ren);
-    ren.* = .{
-        .phase = flecs.new_w_id(world, flecs.Phase),
-        .light_query = light_query,
-
+    mod.state = .{
         .g_buffer = g_buffer,
         .material_store = material_store,
         .light_store = light_store,
@@ -634,51 +627,12 @@ pub fn init(world: *flecs.world_t) !void {
         .post = post,
         .color_correct_pipe = color_correct_pipe,
     };
-    errdefer flecs.delete(world, ren.phase);
-
-    {
-        var desc: flecs.observer_desc_t = .{
-            .callback = updateTransforms,
-            .ctx = ren,
-            .yield_existing = true,
-        };
-        desc.events[0] = flecs.OnSet;
-        desc.filter.terms[0] = .{ .id = flecs.id(Camera) };
-        _ = flecs.observer_init(world, &desc);
-    }
-
-    // TODO: enforce strict ordering
-    {
-        var desc: flecs.system_desc_t = .{
-            .callback = opaqueGeometry,
-            .ctx = ren,
-        };
-        desc.query.filter.terms[0] = .{ .id = flecs.id(OpaqueMaterial) };
-        desc.query.filter.terms[1] = .{ .id = flecs.id(Geometry) };
-
-        flecs.SYSTEM(world, "amity/render/deferred/opaque", ren.phase, &desc);
-    }
-
-    {
-        var desc: flecs.system_desc_t = .{
-            .callback = colorCorrect,
-            .ctx = ren,
-            .ctx_free = deinit,
-        };
-
-        flecs.SYSTEM(world, "amity/render/color_correct", ren.phase, &desc);
-    }
 
     log.debug("init", .{});
 }
 
-fn deinit(ctx: ?*anyopaque) callconv(.C) void {
-    const ren: *Renderer = @ptrCast(@alignCast(ctx.?));
-
-    // TODO: delete phase entity (we don't store the world, but maybe we should)
-    // flecs.delete(world, ren.phase);
-    // TODO: delete query (causes a general protection fault atm, I guess the world is destroying it before we do)
-    // flecs.query_fini(ren.light_query);
+pub fn deinit(mod: *Mod) error{}!void {
+    const ren = &mod.state;
 
     ren.g_buffer.depth.release();
     ren.g_buffer.normal_material.release();
@@ -696,8 +650,6 @@ fn deinit(ctx: ?*anyopaque) callconv(.C) void {
 
     ren.post.deinit();
     ren.color_correct_pipe.release();
-
-    mach.allocator.destroy(ren);
 }
 
 /// Create a texture the same size as the swapchain
@@ -716,125 +668,150 @@ fn createSwapchainTexture(format: gpu.Texture.Format, usage: gpu.Texture.UsageFl
     return tex.createView(null);
 }
 
-//// GPU sync callbacks ////
+pub fn tick(mod: *Mod) !void {
+    updateTransforms(mod);
+    try drawOpaques(mod);
+    try shadeOpaques(mod);
+    colorCorrect(mod);
 
-fn updateTransforms(it: *flecs.iter_t) callconv(.C) void {
-    const ren: *Renderer = @ptrCast(@alignCast(it.ctx.?));
-
-    for (flecs.field(it, Camera, 1).?) |cam| {
-        const view = cam.view();
-        const proj = cam.proj(mach.size());
-        const vp = math.mul(view, proj);
-        const inv_vp = math.inverse(vp);
-
-        mach.queue.writeBuffer(ren.trans_uniform_buf, 0, &[_]Transforms{.{
-            .view = view,
-            .vp = vp,
-            .inv_vp = inv_vp,
-        }});
+    // Remove dirty flags
+    var it = mod.entities.query(.{ .all = &.{
+        .{ .amity_renderer = &.{.dirty} },
+    } });
+    while (it.next()) |arche| {
+        for (arche.slice(.entity, .id)) |id| {
+            try mod.remove(id, .dirty);
+        }
     }
 }
 
-//// Rendering phases ////
+fn updateTransforms(mod: *Mod) void {
+    var it = mod.entities.query(.{ .all = &.{
+        .{ .amity_renderer = &.{ .dirty, .camera } },
+    } });
+    var done = false;
+    while (it.next()) |arche| {
+        for (arche.slice(.amity_renderer, .camera)) |cam| {
+            std.debug.assert(!done); // We don't yet support multiple cameras per scene
+            done = true;
 
-fn opaqueGeometry(it: *flecs.iter_t) callconv(.C) void {
-    const ren: *Renderer = @ptrCast(@alignCast(it.ctx.?));
+            const view = cam.view();
+            const proj = cam.proj(mach.size());
+            const vp = math.mul(view, proj);
+            const inv_vp = math.inverse(vp);
 
-    const mat = flecs.field(it, OpaqueMaterial, 1).?;
-    const geom = flecs.field(it, Geometry, 2).?;
-
-    // TODO: use events to update material store rather than re-uploading every time
-    ren.material_store.clear();
-    for (mat) |m| {
-        ren.material_store.append(m) catch @panic("OOM");
+            mach.queue.writeBuffer(mod.state.trans_uniform_buf, 0, &[_]Transforms{.{
+                .view = view,
+                .vp = vp,
+                .inv_vp = inv_vp,
+            }});
+        }
     }
-    ren.material_store.upload();
+}
+
+fn drawOpaques(mod: *Mod) !void {
+    const ren = &mod.state;
+    // TODO: cache material data
+    ren.material_store.clear();
+
+    const encoder = mach.device.createCommandEncoder(null);
+    defer encoder.release();
 
     // Draw to g-buffer
     // TODO: batching
-    for (geom, 0..) |g, i| {
-        // TODO: cache uniform data
-        mach.queue.writeBuffer(ren.geom_uniform_buf, 0, &[_]GeometryUniforms{.{
-            .material_idx = @intCast(i),
-        }});
-
-        const encoder = mach.device.createCommandEncoder(null);
-        defer encoder.release();
-
-        const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
-            .color_attachments = &.{.{
-                .view = ren.g_buffer.normal_material,
-                .clear_value = black,
-                .load_op = if (i == 0) .clear else .load,
-                .store_op = .store,
-            }},
-            .depth_stencil_attachment = &.{
-                .view = ren.g_buffer.depth,
-                .depth_clear_value = 1,
-                .depth_load_op = if (i == 0) .clear else .load,
-                .depth_store_op = .store,
-            },
-        }));
-        defer pass.release();
-
-        pass.setPipeline(ren.geom_pipe);
-        pass.setBindGroup(0, ren.geom_bind, &.{});
-        pass.setIndexBuffer(g.index_buffer, .uint32, 0, g.index_count * @sizeOf(u32));
-        pass.setVertexBuffer(0, g.pos_buffer, 0, g.vertex_count * 3 * @sizeOf(f32));
-        pass.setVertexBuffer(1, g.normal_buffer, 0, g.vertex_count * 3 * @sizeOf(f32));
-        pass.drawIndexed(g.index_count, 1, 0, 0, 0);
-        pass.end();
-
-        mach.queue.submit(&.{encoder.finish(null)});
-    }
-
-    // TODO: use events
-    {
-        ren.light_store.clear();
-        var light_it = flecs.query_iter(it.world, ren.light_query);
-        while (flecs.query_next(&light_it)) {
-            const dir = flecs.field(&light_it, light.Directional, 1).?;
-            for (dir) |l| {
-                ren.light_store.append(l) catch @panic("OOM");
-            }
+    var it = mod.entities.query(.{ .all = &.{
+        .{ .amity_renderer = &.{ .opaque_material, .geometry } },
+    } });
+    var i: u32 = 0;
+    while (it.next()) |arche| {
+        for (arche.slice(.amity_renderer, .opaque_material)) |m| {
+            try ren.material_store.append(m);
         }
 
-        ren.light_store.upload();
+        for (arche.slice(.amity_renderer, .geometry)) |g| {
+            // TODO: cache uniform data
+            mach.queue.writeBuffer(ren.geom_uniform_buf, 0, &[_]GeometryUniforms{.{
+                .material_idx = i,
+            }});
+
+            const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
+                .color_attachments = &.{.{
+                    .view = ren.g_buffer.normal_material,
+                    .clear_value = black,
+                    .load_op = if (i == 0) .clear else .load,
+                    .store_op = .store,
+                }},
+                .depth_stencil_attachment = &.{
+                    .view = ren.g_buffer.depth,
+                    .depth_clear_value = 1,
+                    .depth_load_op = if (i == 0) .clear else .load,
+                    .depth_store_op = .store,
+                },
+            }));
+            defer pass.release();
+
+            pass.setPipeline(ren.geom_pipe);
+            pass.setBindGroup(0, ren.geom_bind, &.{});
+            pass.setIndexBuffer(g.index_buffer, .uint32, 0, g.index_count * @sizeOf(u32));
+            pass.setVertexBuffer(0, g.pos_buffer, 0, g.vertex_count * 3 * @sizeOf(f32));
+            pass.setVertexBuffer(1, g.normal_buffer, 0, g.vertex_count * 3 * @sizeOf(f32));
+            pass.drawIndexed(g.index_count, 1, 0, 0, 0);
+            pass.end();
+
+            i += 1;
+        }
     }
 
-    // Shade drawn geometry
-    {
-        const encoder = mach.device.createCommandEncoder(null);
-        defer encoder.release();
-
-        const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
-            .color_attachments = &.{
-                ren.post.targetAttach(),
-            },
-        }));
-        defer pass.release();
-        ren.post.flip();
-
-        const mat_bind = ren.material_store.bindGroup();
-        defer mat_bind.release();
-
-        const light_bind = ren.light_store.bindGroup();
-        defer light_bind.release();
-
-        pass.setPipeline(ren.shade_pipe);
-        pass.setBindGroup(0, ren.shade_bind, null);
-        pass.setBindGroup(1, ren.g_buffer.bind, null);
-        pass.setBindGroup(2, mat_bind, null);
-        pass.setBindGroup(3, light_bind, null);
-        pass.draw(3, 1, 0, 0);
-        pass.end();
-
-        mach.queue.submit(&.{encoder.finish(null)});
-    }
+    mach.queue.submit(&.{encoder.finish(null)});
+    ren.material_store.upload();
 }
 
-fn colorCorrect(it: *flecs.iter_t) callconv(.C) void {
-    const ren: *Renderer = @ptrCast(@alignCast(it.ctx.?));
+fn shadeOpaques(mod: *Mod) !void {
+    const ren = &mod.state;
+
+    // TODO: cache light data
+    ren.light_store.clear();
+    var it = mod.entities.query(.{ .all = &.{
+        .{ .amity_renderer = &.{.light_directional} },
+    } });
+    while (it.next()) |arche| {
+        for (arche.slice(.amity_renderer, .light_directional)) |l| {
+            try ren.light_store.append(l);
+        }
+    }
+    try ren.light_store.upload();
+
+    // Shade drawn geometry
+    const encoder = mach.device.createCommandEncoder(null);
+    defer encoder.release();
+
+    const pass = encoder.beginRenderPass(&gpu.RenderPassDescriptor.init(.{
+        .color_attachments = &.{
+            ren.post.targetAttach(),
+        },
+    }));
+    defer pass.release();
+    ren.post.flip();
+
+    const mat_bind = ren.material_store.bindGroup();
+    defer mat_bind.release();
+
+    const light_bind = ren.light_store.bindGroup();
+    defer light_bind.release();
+
+    pass.setPipeline(ren.shade_pipe);
+    pass.setBindGroup(0, ren.shade_bind, null);
+    pass.setBindGroup(1, ren.g_buffer.bind, null);
+    pass.setBindGroup(2, mat_bind, null);
+    pass.setBindGroup(3, light_bind, null);
+    pass.draw(3, 1, 0, 0);
+    pass.end();
+
+    mach.queue.submit(&.{encoder.finish(null)});
+}
+
+fn colorCorrect(mod: *Mod) void {
+    const ren = &mod.state;
 
     const dest = mach.swap_chain.getCurrentTextureView().?;
     defer dest.release();

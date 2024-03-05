@@ -20,7 +20,6 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
             .formats = @as([]const u8, "Obj,STL,Ply,glTF,glTF2"),
         }),
-        .zflecs = b.dependency("zflecs", opts),
         .zmath = b.dependency("zmath", opts),
     };
 
@@ -30,7 +29,6 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
     amity.addImport("mach", deps.mach.module("mach"));
-    amity.addImport("flecs", deps.zflecs.module("zflecs"));
     amity.addImport("zmath", deps.zmath.module("zmath"));
     amity.linkLibrary(deps.assimp.artifact("assimp"));
 

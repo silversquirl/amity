@@ -4,20 +4,19 @@ const mach = @import("mach").core;
 
 pub const App = @This();
 
-engine: amity.Engine,
+world: amity.World,
 
 pub fn init(app: *App) !void {
     try mach.init(.{});
 
-    app.* = .{
-        .engine = try amity.Engine.init(.{
-            .renderer = true,
-        }),
-    };
+    var world = try amity.World.init(mach.allocator);
+    try world.send(null, .init, .{});
+    app.* = .{ .world = world };
 }
 
 pub fn deinit(app: *App) void {
-    app.engine.deinit();
+    app.world.send(null, .deinit, .{}) catch @compileError("deinit may not error");
+    app.world.deinit();
     mach.deinit();
 }
 
@@ -30,5 +29,6 @@ pub fn update(app: *App) !bool {
         }
     }
 
-    return app.engine.update(mach.delta_time);
+    try app.world.send(null, .tick, .{mach.delta_time});
+    return false;
 }

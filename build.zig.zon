@@ -11,7 +11,6 @@
             .url = "https://github.com/MasterQ32/zig-assimp/archive/0bd9b7a351f7caa1b6e98cbdf40e05fc71a33c70.tar.gz",
             .hash = "122015247b178258ee2fd9f7fbd3f8025138e8e38b5cbecdc94262974da49bd1c225",
         },
-        .zflecs = .{ .path = "vendor/zflecs" },
         .zmath = .{ .path = "vendor/zmath" },
     },
 

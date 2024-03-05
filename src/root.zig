@@ -1,5 +1,5 @@
 const std = @import("std");
-const flecs = @import("flecs");
+const ecs = @import("mach").ecs;
 const mach = @import("mach").core;
 const math = @import("zmath");
 const c = @cImport({
@@ -8,33 +8,27 @@ const c = @cImport({
     @cInclude("assimp/postprocess.h");
 });
 
-const Camera = @import("Camera.zig");
-const Renderer = @import("Renderer.zig");
+pub const Renderer = @import("Renderer.zig");
+
+// TODO: config
+pub const World = ecs.World(.{
+    Engine,
+    Renderer,
+});
 
 pub const Engine = struct {
-    world: *flecs.world_t,
+    pub const name = .amity_engine;
+    pub const components = struct {};
+    pub const Mod = World.Mod(Engine);
 
-    pub const InitOptions = packed struct {
-        renderer: bool = true,
-    };
-
-    pub fn init(opts: InitOptions) !Engine {
-        const world = flecs.init();
-        errdefer _ = flecs.fini(world);
-
-        flecs.COMPONENT(world, Camera);
-
-        if (opts.renderer) {
-            try Renderer.init(world);
-        }
-
-        try loadScene(world, "../../assets/cube.obj");
+    pub fn init(mod: *Mod, ren: *Renderer.Mod) !void {
+        try loadScene(ren, "../../assets/cube.obj");
 
         // Add sun
         // TODO: light importing
         {
-            const sun = flecs.new_entity(world, "Sun");
-            _ = flecs.set(world, sun, Renderer.light.Directional, .{
+            const sun = try mod.newEntity();
+            try ren.set(sun, .light_directional, .{
                 .color = .{ 255, 255, 255 },
                 .dir = math.normalize3(math.f32x4(-1.0, -2.0, -1.0, 0.0)),
             });
@@ -42,51 +36,32 @@ pub const Engine = struct {
 
         // Add camera
         {
-            const cam = flecs.new_entity(world, "Camera");
-            _ = flecs.set(world, cam, Camera, .{
+            const cam = try mod.newEntity();
+            try ren.set(cam, .camera, .{
                 .pos = .{ 0.5, 0.5, 0.5 },
             });
+            try ren.set(cam, .dirty, {});
         }
+    }
 
+    pub fn tick(mod: *Mod, ren: *Renderer.Mod, dt: f32) !void {
         // Spin camera
-        {
-            var desc: flecs.system_desc_t = .{ .callback = spinCamera };
-            desc.query.filter.terms[0] = .{ .id = flecs.id(Camera) };
-
-            flecs.SYSTEM(world, "amity/camera", flecs.OnUpdate, &desc);
+        const q = math.quatFromNormAxisAngle(math.f32x4(0, 1, 0, 0), dt * std.math.tau / 16);
+        var it = mod.entities.query(.{ .all = &.{
+            .{ .amity_renderer = &.{.camera} },
+        } });
+        while (it.next()) |arche| {
+            for (arche.slice(.entity, .id), arche.slice(.amity_renderer, .camera)) |id, cam| {
+                var new = cam;
+                math.storeArr3(&new.pos, math.rotate(q, math.loadArr3(cam.pos)));
+                try ren.set(id, .camera, new);
+                try ren.set(id, .dirty, {});
+            }
         }
-
-        _ = flecs.progress(world, 0);
-        return .{
-            .world = world,
-        };
-    }
-
-    pub fn deinit(eng: *Engine) void {
-        _ = flecs.fini(eng.world);
-    }
-
-    pub fn update(eng: *Engine, dt: f32) !bool {
-        var corrected_dt = dt;
-        if (dt == 0) {
-            std.log.debug("zero dt, correcting to small value", .{});
-            corrected_dt = std.math.floatEps(f32);
-        }
-        return !flecs.progress(eng.world, dt);
     }
 };
 
-fn spinCamera(it: *flecs.iter_t) callconv(.C) void {
-    const dt = it.delta_time;
-    const q = math.quatFromNormAxisAngle(math.f32x4(0, 1, 0, 0), dt * std.math.tau / 8);
-    for (flecs.field(it, Camera, 1).?, it.entities()) |cam, e| {
-        var new = cam;
-        math.storeArr3(&new.pos, math.rotate(q, math.loadArr3(cam.pos)));
-        _ = flecs.set(it.world, e, Camera, new);
-    }
-}
-
-fn loadScene(world: *flecs.world_t, path: [:0]const u8) !void {
+fn loadScene(ren: *Renderer.Mod, path: [:0]const u8) !void {
     const scene = c.aiImportFile(
         path,
         c.aiProcess_Triangulate |
@@ -139,9 +114,7 @@ fn loadScene(world: *flecs.world_t, path: [:0]const u8) !void {
 
     var indices = std.ArrayList(u32).init(mach.allocator);
     defer indices.deinit();
-    var name_buf = std.ArrayList(u8).init(mach.allocator);
-    defer name_buf.deinit();
-    for (scene.*.mMeshes[0..scene.*.mNumMeshes], 0..) |mesh, mesh_index| {
+    for (scene.*.mMeshes[0..scene.*.mNumMeshes]) |mesh| {
         indices.clearRetainingCapacity();
         for (mesh.*.mFaces[0..mesh.*.mNumFaces]) |face| {
             std.debug.assert(face.mNumIndices == 3); // We triangulated already so this should be true
@@ -153,20 +126,8 @@ fn loadScene(world: *flecs.world_t, path: [:0]const u8) !void {
         const normals: [][3]f32 = @ptrCast(mesh.*.mNormals[0..mesh.*.mNumVertices]);
         const vertices: [][3]f32 = @ptrCast(mesh.*.mVertices[0..mesh.*.mNumVertices]);
 
-        name_buf.clearRetainingCapacity();
-        try name_buf.appendSlice("mesh");
-        if (mesh.*.mName.length > 0) {
-            const name = mesh.*.mName;
-            try name_buf.writer().print(": {s}", .{
-                name.data[0..name.length],
-            });
-        } else {
-            try name_buf.writer().print(" #{}", .{mesh_index});
-        }
-        try name_buf.append(0);
-
-        const entity = flecs.new_entity(world, name_buf.items[0 .. name_buf.items.len - 1 :0]);
-        _ = flecs.set(world, entity, Renderer.Geometry, Renderer.Geometry.init(indices.items, vertices, normals));
-        _ = flecs.set(world, entity, Renderer.OpaqueMaterial, materials[mesh.*.mMaterialIndex]);
+        const entity = try ren.newEntity();
+        try ren.set(entity, .geometry, Renderer.Geometry.init(indices.items, vertices, normals));
+        try ren.set(entity, .opaque_material, materials[mesh.*.mMaterialIndex]);
     }
 }
